@@ -1119,6 +1119,7 @@ input[type=date]{color-scheme:light}
     </div>
   </div>
   <div class="titlebar-right">
+    <span style="font-family:ui-monospace,monospace;font-size:13px;color:var(--text2);letter-spacing:.02em" id="live-clock"></span>
     <span class="balance-chip" id="balance-chip">Balans: <strong>—</strong></span>
     <span style="font-size:12px;color:var(--text3)" id="last-cycle-label"></span>
   </div>
@@ -2486,7 +2487,19 @@ window.addEventListener('DOMContentLoaded',()=>{
   pollStatus();
   loadBalanceOverview();
   setInterval(loadTickers, 30000);
-  setInterval(loadBalanceOverview, 15000);  // elke 15 seconden vernieuwen
+  setInterval(loadBalanceOverview, 15000);
+
+  // Live klok — Belgische tijd, tikt elke seconde
+  function tickClock(){
+    const now=new Date();
+    const opts={timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false};
+    const dateOpts={timeZone:'Europe/Brussels',weekday:'short',day:'numeric',month:'short'};
+    const t=now.toLocaleTimeString('nl-BE',opts);
+    const d=now.toLocaleDateString('nl-BE',dateOpts);
+    document.getElementById('live-clock').textContent=d+' '+t;
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
 });
 </script>
 </body>
