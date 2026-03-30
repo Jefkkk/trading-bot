@@ -1,261 +1,153 @@
-# risk_manager.py
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Beschermt je kapitaal via daglimieten,
-# trailing stops en positiebeheer
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# -*- coding: utf-8 -*-
+import logging
+from datetime import date
 
-from datetime import datetime, date
-from logger import log, log_daily_summary
-from config import MAX_DAILY_LOSS_PCT, TRAILING_STOP_ENABLED, TRAILING_STOP_PCT
+logger = logging.getLogger('RiskManager')
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DAGELIJKSE TELLER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class RiskManager:
+    def __init__(
+        self,
+        max_leverage:       int   = 20,
+        risk_per_trade:     float = 0.02,
+        max_trade_usd:      float = 3.0,    # Harde cap: max $3 margin per trade
+        max_total_exposure: float = 0.50,   # Max 50% van balans tegelijk in markt
+        stop_loss_pct:      float = 0.20,   # 20% SL (ruimer, minder noise stops)
+        take_profit_pct:    float = 0.30,   # 30% TP (1:1.5 R/R)
+        max_daily_loss_usd: float = 5.0,    # Stop bij $5 dagverlies
+        max_daily_loss_pct: float = 0.20,   # Of bij 20% van balans (wat eerst bereikt wordt)
+    ):
+        self.max_leverage        = max_leverage
+        self.risk_per_trade      = risk_per_trade
+        self.max_trade_usd       = max_trade_usd
+        self.max_total_exposure  = max_total_exposure
+        self.stop_loss_pct       = stop_loss_pct
+        self.take_profit_pct     = take_profit_pct
+        self.max_daily_loss_usd  = max_daily_loss_usd
+        self.max_daily_loss_pct  = max_daily_loss_pct
 
-class DailyTracker:
-    """
-    Houdt dagelijkse statistieken bij.
-    Reset automatisch om middernacht.
-    """
+        self.daily_pnl           = 0.0
+        self.daily_start_balance = 0.0
+        self.last_reset_date     = date.today()
+        self.trade_count_today   = 0
 
-    def __init__(self):
-        self.reset()
+    def reset_daily_if_needed(self, balance: float):
+        today = date.today()
+        if today != self.last_reset_date:
+            logger.info(f"Nieuwe dag | gisteren PnL: {self.daily_pnl:+.4f} USDT")
+            self.daily_pnl           = 0.0
+            self.daily_start_balance = balance
+            self.last_reset_date     = today
+            self.trade_count_today   = 0
+        elif self.daily_start_balance == 0.0:
+            self.daily_start_balance = balance
 
-    def reset(self):
-        self.date         = date.today()
-        self.total_trades = 0
-        self.wins         = 0
-        self.losses       = 0
-        self.total_pnl    = 0.0
-        self.start_balance = None
-        log("🔄 Dagelijkse teller gereset")
-
-    def check_new_day(self):
-        """Reset automatisch bij nieuwe dag."""
-        if date.today() != self.date:
-            log_daily_summary(
-                self.total_trades,
-                self.wins,
-                self.losses,
-                self.total_pnl
-            )
-            self.reset()
-
-    def register_trade(self, pnl: float):
-        """Registreer een afgesloten trade."""
-        self.check_new_day()
-        self.total_trades += 1
-        self.total_pnl    += pnl
-
-        if pnl > 0:
-            self.wins   += 1
-            log(f"✅ Winnende trade: +{pnl:.4f} USDT "
-                f"(dag totaal: {self.total_pnl:+.4f} USDT)")
-        else:
-            self.losses += 1
-            log(f"❌ Verliezende trade: {pnl:.4f} USDT "
-                f"(dag totaal: {self.total_pnl:+.4f} USDT)")
-
-    def is_daily_limit_reached(self, current_balance: float) -> bool:
-        """
-        Controleer of het dagelijkse verlies de limiet bereikt heeft.
-        Stopt de bot als dit het geval is.
-        """
-        self.check_new_day()
-
-        if self.start_balance is None:
-            self.start_balance = current_balance
+    def is_daily_loss_exceeded(self, balance: float) -> bool:
+        if self.daily_start_balance <= 0:
             return False
-
-        loss_pct = (self.start_balance - current_balance) / self.start_balance
-
-        if loss_pct >= MAX_DAILY_LOSS_PCT:
-            log(
-                f"🛑 DAGELIJKSE VERLIES LIMIET BEREIKT: "
-                f"{loss_pct*100:.1f}% verlies "
-                f"(max: {MAX_DAILY_LOSS_PCT*100:.0f}%) — "
-                f"Bot gestopt tot morgen"
+        # Controleer absolute dollar grens
+        if self.daily_pnl <= -self.max_daily_loss_usd:
+            logger.warning(
+                f"DAGVERLIES LIMIET: ${abs(self.daily_pnl):.2f} verlies "
+                f"(max ${self.max_daily_loss_usd})  --  trading gestopt"
             )
             return True
-
-        remaining = (MAX_DAILY_LOSS_PCT - loss_pct) * self.start_balance
-        log(f"📊 Dagverlies: {loss_pct*100:.1f}% | "
-            f"Nog {remaining:.2f} USDT buffer over")
+        # Controleer procentuele grens
+        loss_pct = (self.daily_start_balance - balance) / self.daily_start_balance
+        if loss_pct >= self.max_daily_loss_pct:
+            logger.warning(
+                f"DAGVERLIES LIMIET: {loss_pct:.1%} verlies "
+                f"(max {self.max_daily_loss_pct:.0%})  --  trading gestopt"
+            )
+            return True
         return False
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# POSITIE BEWAKER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class PositionManager:
-    """
-    Beheert open posities en trailing stops
-    voor alle coins tegelijk.
-    """
-
-    def __init__(self):
-        # { symbol: positie_info }
-        self.positions = {}
-
-    def open_position(self, symbol, side, entry_price,
-                      amount, sl_pct, tp_pct):
-        """Registreer een nieuwe open positie."""
-        if side == "buy":
-            sl_price = entry_price * (1 - sl_pct)
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            sl_price = entry_price * (1 + sl_pct)
-            tp_price = entry_price * (1 - tp_pct)
-
-        self.positions[symbol] = {
-            "side":          side,
-            "entry_price":   entry_price,
-            "amount":        amount,
-            "sl_price":      sl_price,
-            "tp_price":      tp_price,
-            "highest_price": entry_price,   # Voor trailing stop
-            "lowest_price":  entry_price,   # Voor trailing stop short
-            "opened_at":     datetime.now(),
-        }
-        log(f"📂 Positie geopend: {side.upper()} {symbol} "
-            f"@ {entry_price} | SL: {sl_price:.4f} | TP: {tp_price:.4f}")
-
-    def has_position(self, symbol) -> bool:
-        """Controleer of er al een open positie is voor dit symbool."""
-        return symbol in self.positions
-
-    def update_trailing_stop(self, symbol, current_price):
+    def calculate_position_size(self, balance: float, price: float,
+                                leverage: int,
+                                contract_multiplier: float = 1.0) -> int:
         """
-        Pas trailing stop aan als prijs gunstig beweegt.
-        Stop-loss volgt de prijs omhoog (long) of omlaag (short).
+        Berekent contracts met een dubbele cap:
+        1. Percentage-gebaseerd (risk_per_trade% van balans)
+        2. Harde dollar cap (max_trade_usd margin)
+
+        Gate.io USDT perps: 1 contract = 1 USD notional
+        margin = contracts / leverage
         """
-        if not TRAILING_STOP_ENABLED:
-            return
-        if symbol not in self.positions:
-            return
-
-        pos = self.positions[symbol]
-
-        if pos["side"] == "buy":
-            # Prijs steeg → stop omhoog aanpassen
-            if current_price > pos["highest_price"]:
-                pos["highest_price"] = current_price
-                new_sl = current_price * (1 - TRAILING_STOP_PCT)
-
-                if new_sl > pos["sl_price"]:
-                    old_sl = pos["sl_price"]
-                    pos["sl_price"] = new_sl
-                    log(f"📈 Trailing stop aangepast {symbol}: "
-                        f"{old_sl:.4f} → {new_sl:.4f} "
-                        f"(prijs: {current_price:.4f})")
-
-        elif pos["side"] == "sell":
-            # Prijs daalde → stop omlaag aanpassen
-            if current_price < pos["lowest_price"]:
-                pos["lowest_price"] = current_price
-                new_sl = current_price * (1 + TRAILING_STOP_PCT)
-
-                if new_sl < pos["sl_price"]:
-                    old_sl = pos["sl_price"]
-                    pos["sl_price"] = new_sl
-                    log(f"📉 Trailing stop aangepast {symbol}: "
-                        f"{old_sl:.4f} → {new_sl:.4f} "
-                        f"(prijs: {current_price:.4f})")
-
-    def should_close(self, symbol, current_price):
-        """
-        Controleer of een positie gesloten moet worden.
-        Geeft terug: ('sl', reden) / ('tp', reden) / (None, None)
-        """
-        if symbol not in self.positions:
-            return None, None
-
-        pos = self.positions[symbol]
-
-        if pos["side"] == "buy":
-            if current_price <= pos["sl_price"]:
-                return "sl", f"Stop-loss geraakt @ {current_price:.4f}"
-            if current_price >= pos["tp_price"]:
-                return "tp", f"Take-profit geraakt @ {current_price:.4f}"
-
-        elif pos["side"] == "sell":
-            if current_price >= pos["sl_price"]:
-                return "sl", f"Stop-loss geraakt @ {current_price:.4f}"
-            if current_price <= pos["tp_price"]:
-                return "tp", f"Take-profit geraakt @ {current_price:.4f}"
-
-        return None, None
-
-    def calculate_pnl(self, symbol, close_price):
-        """Bereken PnL van een positie bij sluiting."""
-        if symbol not in self.positions:
+        if price <= 0 or self.stop_loss_pct <= 0:
             return 0
 
-        pos    = self.positions[symbol]
-        entry  = pos["entry_price"]
-        amount = pos["amount"]
+        # Methode 1: procentueel
+        risk_amt      = balance * self.risk_per_trade
+        contracts_pct = int(risk_amt / (contract_multiplier * self.stop_loss_pct))
 
-        if pos["side"] == "buy":
-            pnl = (close_price - entry) * amount
-        else:
-            pnl = (entry - close_price) * amount
+        # Methode 2: vaste dollar cap
+        # margin = max_trade_usd  →  contracts = max_trade_usd * leverage
+        contracts_usd = int(self.max_trade_usd * leverage)
 
-        return round(pnl, 6)
+        # Gebruik de KLEINSTE van beide
+        contracts = min(contracts_pct, contracts_usd)
+        contracts = max(1, contracts)
 
-    def close_position(self, symbol, close_price, reason=""):
-        """Verwijder positie uit geheugen na sluiting."""
-        if symbol not in self.positions:
+        # Exposure cap: margin mag niet meer zijn dan max_total_exposure% van balans
+        margin     = contracts / leverage
+        max_margin = balance * self.max_total_exposure
+        if margin > max_margin:
+            contracts = max(1, int(max_margin * leverage))
+
+        # Minimum balans bescherming: niet traden als balans te laag is
+        if balance < 5.0:
+            logger.warning(f"Balans ${balance:.2f} te laag (min $5)  --  geen trade")
             return 0
 
-        pnl = self.calculate_pnl(symbol, close_price)
-        pos = self.positions.pop(symbol)
+        logger.info(
+            f"Sizing: bal=${balance:.2f} max_trade=${self.max_trade_usd} "
+            f"lev={leverage}x → {contracts} contracts "
+            f"margin=${contracts/leverage:.2f} "
+            f"max_loss=${contracts*self.stop_loss_pct:.2f}"
+        )
+        return contracts
 
-        duration = datetime.now() - pos["opened_at"]
-        minutes  = int(duration.total_seconds() / 60)
+    def get_stop_loss_price(self, entry: float, is_long: bool,
+                            sl_pct: float = None) -> float:
+        pct = sl_pct if sl_pct is not None else self.stop_loss_pct
+        return round(entry * ((1 - pct) if is_long else (1 + pct)), 8)
 
-        log(f"📁 Positie gesloten: {symbol} | "
-            f"Reden: {reason} | "
-            f"PnL: {pnl:+.4f} USDT | "
-            f"Duur: {minutes} min")
+    def get_take_profit_price(self, entry: float, is_long: bool,
+                              tp_pct: float = None) -> float:
+        pct = tp_pct if tp_pct is not None else self.take_profit_pct
+        return round(entry * ((1 + pct) if is_long else (1 - pct)), 8)
 
-        return pnl
+    def get_optimal_leverage(self, volatility_score: float,
+                             sl_pct: float = 0.0) -> int:
+        """
+        Leverage gebaseerd op daadwerkelijke SL percentage.
+        Regel: max verlies op SL hit = 80% van margin.
+        → max_lev = 0.80 / sl_pct
+          SL 1%  → max 80x (gecapped op max_leverage)
+          SL 5%  → max 16x
+          SL 10% → max 8x
+          SL 20% → max 4x
+          SL 30% → max 2x
+        Bij hoge volatiliteit extra korting.
+        """
+        if sl_pct > 0:
+            safe_lev = int(0.80 / sl_pct)
+        else:
+            safe_lev = self.max_leverage
 
-    def get_open_symbols(self):
-        """Geef lijst van symbolen met open posities."""
-        return list(self.positions.keys())
-```
+        # Volatiliteitsdiscount
+        if   volatility_score > 0.75: discount = 0.40
+        elif volatility_score > 0.50: discount = 0.60
+        elif volatility_score > 0.25: discount = 0.80
+        else:                         discount = 1.00
 
----
+        lev = int(safe_lev * discount)
+        return max(1, min(lev, self.max_leverage))
 
-## 🛡️ Wat beschermt de risk manager?
-
-**`DailyTracker`** — reset elke dag om middernacht en stopt de bot automatisch bij 15% dagverlies
-
-**`PositionManager`** — beheert alle open posities tegelijk voor de 4 coins:
-```
-Positie geopend BTC @ €65.000
-  ↓ prijs stijgt naar €66.000
-  ↓ trailing stop volgt mee → SL nu op €64.990
-  ↓ prijs zakt terug naar €64.990
-  ↓ automatisch gesloten met winst ✅
-
-Zonder trailing stop → wachten op originele SL van €63.050
-                     → minder winst of zelfs verlies
-```
-
----
-
-## ✅ Bestanden status
-```
-├── Procfile          ✅ klaar
-├── runtime.txt       ✅ klaar
-├── requirements.txt  ✅ klaar
-├── config.py         ✅ klaar
-├── .env              ✅ klaar
-├── exchange.py       ✅ klaar
-├── logger.py         ✅ klaar
-├── strategy.py       ✅ klaar
-├── risk_manager.py   ✅ klaar  ← net gedaan
-└── main.py           ← laatste stap! 🎯
+    def update_pnl(self, pnl: float):
+        self.daily_pnl         += pnl
+        self.trade_count_today += 1
+        logger.info(
+            f"PnL: {pnl:+.4f} | dag={self.daily_pnl:+.4f} USDT | "
+            f"trades={self.trade_count_today}"
+        )
