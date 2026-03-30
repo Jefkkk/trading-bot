@@ -3,9 +3,12 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from strategy import TradingStrategy
 from risk_manager import RiskManager
 from gate_client import GateFuturesClient
+
+TZ = ZoneInfo('Europe/Brussels')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +28,7 @@ def write_heartbeat(cycle_count: int, errors: int):
     """Schrijf heartbeat naar bestand voor externe monitoring."""
     try:
         with open(HEARTBEAT_FILE, 'w') as f:
-            f.write(f"{datetime.now().isoformat()}\n")
+            f.write(f"{datetime.now(TZ).isoformat()}\n")
             f.write(f"cycles={cycle_count}\n")
             f.write(f"errors={errors}\n")
     except Exception:
@@ -51,7 +54,7 @@ async def main():
         max_daily_loss_pct = 0.20,
     )
     strat  = TradingStrategy(client, risk, SYMBOLS)
-    started = datetime.now()
+    started = datetime.now(TZ)
     cycle_count = 0
     error_count = 0
 
@@ -62,7 +65,7 @@ async def main():
                 cycle_count += 1
                 write_heartbeat(cycle_count, error_count)
                 if cycle_count % 60 == 0:  # elke ~60 cycli een status log
-                    uptime = datetime.now() - started
+                    uptime = datetime.now(TZ) - started
                     logger.info(
                         f"♥ Heartbeat | uptime={uptime} | "
                         f"cycli={cycle_count} | fouten={error_count}"

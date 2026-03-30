@@ -16,8 +16,11 @@ import json
 import logging
 import math
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional, List
 from dataclasses import dataclass
+
+TZ = ZoneInfo('Europe/Brussels')
 
 logger = logging.getLogger('TradeMemory')
 
@@ -103,7 +106,7 @@ def log_entry(
     market_regime: str = 'unknown',
 ) -> int:
     """Sla een nieuwe trade-entry op. Geeft de trade-ID terug."""
-    ts = datetime.now().isoformat()
+    ts = datetime.now(TZ).isoformat()
     with _db() as conn:
         cur = conn.execute(
             """INSERT INTO trades
@@ -127,7 +130,7 @@ def log_exit(
     exit_reason: str,
 ):
     """Sluit een trade af en sla het resultaat op."""
-    ts = datetime.now().isoformat()
+    ts = datetime.now(TZ).isoformat()
     with _db() as conn:
         conn.execute(
             """UPDATE trades SET
@@ -317,7 +320,7 @@ class TradeEvaluator:
 
         # Sla drempel op
         if new_thresh != old_thresh:
-            ts = datetime.now().isoformat()
+            ts = datetime.now(TZ).isoformat()
             with _db() as conn:
                 conn.execute(
                     """INSERT OR REPLACE INTO thresholds (symbol, threshold, updated_ts, reason)
@@ -358,7 +361,7 @@ class TradeEvaluator:
 
     def full_report(self, symbols: list) -> dict:
         """Genereer een volledig rapport voor alle symbolen."""
-        report = {'generated': datetime.now().isoformat(), 'symbols': {}}
+        report = {'generated': datetime.now(TZ).isoformat(), 'symbols': {}}
         for sym in symbols:
             report['symbols'][sym] = self.evaluate_symbol(sym)
         return report
@@ -430,7 +433,7 @@ class TradeEvaluator:
 
 def get_daily_pnl() -> float:
     """Bereken de totale PnL van vandaag (alle gesloten trades)."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(TZ).strftime('%Y-%m-%d')
     with _db() as conn:
         row = conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE closed=1 AND exit_ts LIKE ?",
@@ -441,7 +444,7 @@ def get_daily_pnl() -> float:
 
 def get_daily_trade_count() -> int:
     """Aantal trades vandaag."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = datetime.now(TZ).strftime('%Y-%m-%d')
     with _db() as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM trades WHERE entry_ts LIKE ?",

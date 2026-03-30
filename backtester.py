@@ -5,8 +5,11 @@ PnL: 1 contract = 1 USD notional (Gate.io USDT perps)
 """
 import logging, math
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 from dataclasses import dataclass, field
+
+TZ = ZoneInfo('Europe/Brussels')
 from indicators import (
     ema, sma, rsi, macd, bollinger_bands, bollinger_width,
     stochastic, vwap, atr, atr_stop, adx, obv, obv_slope,
@@ -725,7 +728,7 @@ class Backtester:
             if isinstance(c,list): return int(c[0]) if c else 0
             return int(c.get('t',c.get('time',0)))
         def _fmt(ts):
-            try: return datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+            try: return datetime.fromtimestamp(ts, tz=TZ).strftime('%Y-%m-%d %H:%M')
             except: return str(ts)
 
         if date_from or date_to:

@@ -5,7 +5,10 @@ import logging
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, render_template_string
+
+TZ = ZoneInfo('Europe/Brussels')
 from gate_client import GateFuturesClient
 from backtester import Backtester, STRATEGIES
 try:
@@ -90,12 +93,12 @@ def bot_loop():
             max_daily_loss_pct = 0.20,
         )
         strategy = TradingStrategy(client, risk, SYMBOLS)
-        bot_state['started_at'] = datetime.now().isoformat()
+        bot_state['started_at'] = datetime.now(TZ).isoformat()
         while bot_state['running']:
             try:
                 prev_count = risk.trade_count_today
                 await strategy.run_cycle()
-                bot_state['last_cycle']  = datetime.now().isoformat()
+                bot_state['last_cycle']  = datetime.now(TZ).isoformat()
                 bot_state['cycle_count'] += 1
                 bot_state['daily_pnl']   = risk.daily_pnl
                 bot_state['trade_count'] = risk.trade_count_today
@@ -108,19 +111,19 @@ def bot_loop():
                 ]
                 # Track trades
                 if risk.trade_count_today > prev_count:
-                    bot_state['last_trade_at'] = datetime.now().isoformat()
+                    bot_state['last_trade_at'] = datetime.now(TZ).isoformat()
                     bot_state['cycles_without_trade'] = 0
                 else:
                     bot_state['cycles_without_trade'] += 1
                 # Heartbeat bestand schrijven (voor externe monitoring)
                 try:
                     with open('heartbeat.txt', 'w') as hb:
-                        hb.write(datetime.now().isoformat())
+                        hb.write(datetime.now(TZ).isoformat())
                 except:
                     pass
             except Exception as e:
                 logger.error(f"Bot loop error: {e}")
-                bot_state['last_error'] = f"{datetime.now().strftime('%H:%M:%S')} {str(e)[:100]}"
+                bot_state['last_error'] = f"{datetime.now(TZ).strftime('%H:%M:%S')} {str(e)[:100]}"
                 bot_state['error_count'] += 1
             await asyncio.sleep(60)
         await client.close()
@@ -140,7 +143,7 @@ def start_bot():
     bot_state['error_count'] = 0
     bot_state['last_error'] = None
     bot_state['cycles_without_trade'] = 0
-    bot_state['started_at'] = datetime.now().isoformat()
+    bot_state['started_at'] = datetime.now(TZ).isoformat()
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
     bot_state['thread'] = t
@@ -154,7 +157,7 @@ def stop_bot():
 @app.route('/api/bot/status')
 def bot_status():
     # Bereken uptime en stalled detectie
-    now = datetime.now()
+    now = datetime.now(TZ)
     uptime_str = ''
     if bot_state['started_at']:
         started = datetime.fromisoformat(bot_state['started_at'])
