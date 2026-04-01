@@ -6,17 +6,28 @@ from gate_client import GateFuturesClient
 from risk_manager import RiskManager
 from indicators import (
     ema, rsi, macd, bollinger_bands, bollinger_width,
-    stochastic, vwap, atr, atr_stop, obv_slope,
+    stochastic, vwap, atr, atr_stop, obv_slope, adx,
     supertrend, calculate_volatility_score
 )
 
 logger = logging.getLogger('Strategy')
 
-# Trade memory: self-kritisch leersysteem
+# Telegram notificaties (optioneel)
+try:
+    from telegram_notify import (
+        notify, notify_trade, notify_close, notify_alert,
+        notify_liquidation_warning, notify_funding, notify_daily_summary,
+        ENABLED as TG_ENABLED
+    )
+except ImportError:
+    TG_ENABLED = False
+
+# Trade memory + equity curve
 try:
     from trade_memory import (
         TradeEvaluator, log_entry, log_exit,
-        build_snapshot, detect_regime, init_db
+        build_snapshot, detect_regime, init_db,
+        log_equity, get_daily_pnl
     )
     init_db()
     _evaluator = TradeEvaluator()
@@ -203,163 +214,152 @@ class TradingStrategy:
     # Max leverage: 10x (BTC is te groot voor 20x)
     # ==========================================================================
     def _signal_btc(self, o: dict, trend: Optional[dict] = None) -> Tuple[str, float]:
+        """
+        BTC v3 — Dual mode: TREND + RANGE auto-switch op ADX.
+        
+        ADX > 25: TREND MODE (pullback + trend-following)
+        ADX < 20: RANGE MODE (BB bounce + RSI extreme)
+        ADX 20-25: beide actief, lagere confidence
+        """
         c, h, l, v = o['closes'], o['highs'], o['lows'], o['volumes']
-
-        e21 = ema(c, 21); e50 = ema(c, 50)
-        rv  = rsi(c, 14)
-        a   = adx(h, l, c, 14)
-
+        e21 = ema(c, 21); e50 = ema(c, 50); rv = rsi(c, 14)
+        a = adx(h, l, c, 14)
+        bbu, bbm, bbl = bollinger_bands(c, 20, 2.0)
+        
         if not all([e21, e50, rv]) or len(c) < 3:
             return 'none', 0.0
-
+        
         price = c[-1]; cr = rv[-1]
-        cur_adx = a[-1] if a else 0
-
-        # --- TREND (multi-TF als beschikbaar, anders zelfde TF) ---
+        cur_adx = a[-1] if a else 15
         trend_bull = e21[-1] > e50[-1]
         trend_bear = e21[-1] < e50[-1]
+        
+        # Multi-TF trend override
         if trend and trend.get('closes'):
             tc = trend['closes']
             te21 = ema(tc, 21); te50 = ema(tc, 50)
             if te21 and te50:
                 trend_bull = te21[-1] > te50[-1]
                 trend_bear = te21[-1] < te50[-1]
+        
+        dist_e21 = (price - e21[-1]) / e21[-1] if e21[-1] else 0
+        
+        # ══════ RANGE MODE (ADX < 25) ══════
+        # Mean-reversion: koop bij lower BB + RSI oversold, verkoop bij upper BB + overbought
+        if cur_adx < 25 and bbu and bbl and len(bbl) >= 2:
+            # Long: prijs raakt/doorbreekt lower BB + RSI laag
+            if price < bbl[-1] * 1.005 and cr < 35:
+                conf = 0.78 if cr < 28 else 0.68
+                return 'long', conf
+            # Short: prijs raakt upper BB + RSI hoog
+            if price > bbu[-1] * 0.995 and cr > 65:
+                conf = 0.78 if cr > 72 else 0.68
+                return 'short', conf
+            # RSI extreme bounce (zeldzamer maar sterker)
+            if cr < 25:
+                return 'long', 0.82
+            if cr > 75:
+                return 'short', 0.82
+        
+        # ══════ TREND MODE (ADX >= 20) ══════
         if not trend_bull and not trend_bear:
             return 'none', 0.0
-
-        # --- ADX: soft gate (< 20 = blok, 20-25 = lagere conf, > 25 = normaal) ---
-        if cur_adx < 20:
-            return 'none', 0.0
+        
         adx_bonus = 0.05 if cur_adx > 30 else 0.0
-
-        # --- Volume: bonus (niet gate!) ---
-        vol_bonus = 0.0
-        if len(v) >= 20:
-            avg_vol = sum(v[-20:]) / 20
-            if avg_vol > 0 and v[-1] > avg_vol * 1.5:
-                vol_bonus = 0.05
-
-        dist_e21 = (price - e21[-1]) / e21[-1] if e21[-1] else 0
-
-        # --- TRIGGER A: EMA Pullback (verruimd: dist < 1.5%, RSI < 50) ---
+        
+        # Trigger A: EMA Pullback
         if trend_bull and -0.015 < dist_e21 < 0.005 and cr < 50:
-            base = 0.70
-            if cr < 35: base = 0.82
-            elif cr < 40: base = 0.75
-            # Candle richting = bonus, niet gate
-            if c[-1] < c[-2]: base += 0.03
-            conf = min(base + adx_bonus + vol_bonus, 0.95)
-            return 'long', conf
-
+            base = 0.72 if cr < 40 else 0.65
+            return 'long', min(base + adx_bonus, 0.90)
         if trend_bear and -0.005 < dist_e21 < 0.015 and cr > 50:
-            base = 0.70
-            if cr > 65: base = 0.82
-            elif cr > 60: base = 0.75
-            if c[-1] > c[-2]: base += 0.03
-            conf = min(base + adx_bonus + vol_bonus, 0.95)
-            return 'short', conf
-
-        # --- TRIGGER B: RSI extreme ---
+            base = 0.72 if cr > 60 else 0.65
+            return 'short', min(base + adx_bonus, 0.90)
+        
+        # Trigger B: RSI extreme in trend
         if trend_bull and cr < 35:
-            conf = min(0.80 + adx_bonus + vol_bonus, 0.95)
-            return 'long', conf
-
+            return 'long', min(0.80 + adx_bonus, 0.92)
         if trend_bear and cr > 65:
-            conf = min(0.80 + adx_bonus + vol_bonus, 0.95)
-            return 'short', conf
-
-        # --- TRIGGER C: Trend-following (wanneer A en B niet vuren) ---
-        # Simpele trendbevestiging: EMA aligned + RSI niet extreem + ADX sterk
-        if trend_bull and 40 < cr < 65 and cur_adx > 25:
-            # Prijs boven EMA21 en EMA21 stijgt
-            e21_slope = _slope(e21, 5) if e21 and len(e21) > 5 else 0
-            if dist_e21 > 0 and e21_slope > 0.001:
-                base = 0.62 + adx_bonus + vol_bonus
-                return 'long', min(base, 0.78)
-
-        if trend_bear and 35 < cr < 60 and cur_adx > 25:
-            e21_slope = _slope(e21, 5) if e21 and len(e21) > 5 else 0
-            if dist_e21 < 0 and e21_slope < -0.001:
-                base = 0.62 + adx_bonus + vol_bonus
-                return 'short', min(base, 0.78)
-
+            return 'short', min(0.80 + adx_bonus, 0.92)
+        
+        # Trigger C: Trend-following
+        if trend_bull and 40 < cr < 65 and cur_adx > 22:
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 > 0 and e21s > 0.0005:
+                return 'long', min(0.60 + adx_bonus, 0.75)
+        if trend_bear and 35 < cr < 60 and cur_adx > 22:
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 < 0 and e21s < -0.0005:
+                return 'short', min(0.60 + adx_bonus, 0.75)
+        
         return 'none', 0.0
 
     # ==========================================================================
-    # ETH  --  Hybride: BB squeeze breakout OF EMA trend + MACD
+    # ETH  --  Dual mode: Trend pullback + Range mean-reversion (v2)
+    #
+    # ADX > 25: Trend mode (EMA pullback + MACD confirmation)
+    # ADX < 20: Range mode (BB bounce + RSI extreme)
+    # Signaalfrequentie target: 5-15% (niet 96% zoals de oude versie)
     # ==========================================================================
     def _signal_eth(self, o: dict) -> Tuple[str, float]:
         c, h, l, v = o['closes'], o['highs'], o['lows'], o['volumes']
-
-        e9  = ema(c, 9); e21 = ema(c, 21); e50 = ema(c, 50)
-        ml, sl_line, hist = macd(c, 12, 26, 9)
+        e21 = ema(c, 21); e50 = ema(c, 50); rv = rsi(c, 14)
+        a = adx(h, l, c, 14)
         bbu, bbm, bbl = bollinger_bands(c, 20, 2.0)
-        bb_w = bollinger_width(c, 20)
-        rv   = rsi(c, 14)
-        from indicators import obv
-        obv_vals = obv(c, v)
-        obv_ema  = ema(obv_vals, 10) if len(obv_vals) >= 10 else []
+        ml, sl_line, hist = macd(c, 12, 26, 9)
 
-        if not all([e9, e21, e50, sl_line, bbu, bb_w, rv]):
+        if not all([e21, e50, rv, bbu]) or len(c) < 3:
             return 'none', 0.0
 
-        price   = c[-1]
-        cur_rsi = rv[-1]
+        price = c[-1]; cr = rv[-1]
+        cur_adx = a[-1] if a else 15
+        dist_e21 = (price - e21[-1]) / e21[-1] if e21[-1] else 0
+        trend_bull = e21[-1] > e50[-1]
+        trend_bear = e21[-1] < e50[-1]
 
-        # Squeeze detectie (bonus, niet vereist)
-        ref_n     = min(30, len(bb_w))
-        avg_width = sum(bb_w[-ref_n:]) / ref_n
-        in_squeeze  = bb_w[-1] < avg_width * 0.80  # versoepeld van 0.70
-        was_squeeze = len(bb_w) > 8 and min(bb_w[-9:-1]) < avg_width * 0.80
-        squeeze_breakout = was_squeeze and not in_squeeze
+        # ══════ RANGE MODE (ADX < 25) ══════
+        if cur_adx < 25 and bbl and len(bbl) >= 2:
+            if price < bbl[-1] * 1.005 and cr < 35:
+                conf = 0.78 if cr < 28 else 0.68
+                return 'long', conf
+            if price > bbu[-1] * 0.995 and cr > 65:
+                conf = 0.78 if cr > 72 else 0.68
+                return 'short', conf
+            if cr < 25: return 'long', 0.82
+            if cr > 75: return 'short', 0.82
 
-        votes = []
+        # ══════ TREND MODE ══════
+        if not trend_bull and not trend_bear:
+            return 'none', 0.0
 
-        # 1. EMA trend alignment
-        if e9[-1] > e21[-1] > e50[-1]:     votes.extend([1, 1])
-        elif e9[-1] < e21[-1] < e50[-1]:   votes.extend([-1, -1])
-        else:                               votes.append(0)
+        adx_bonus = 0.05 if cur_adx > 30 else 0.0
+        macd_bull = sl_line and len(ml) >= 2 and ml[-2] <= sl_line[-2] and ml[-1] > sl_line[-1]
+        macd_bear = sl_line and len(ml) >= 2 and ml[-2] >= sl_line[-2] and ml[-1] < sl_line[-1]
 
-        # 2. Squeeze breakout (bonus als het er is)
-        if squeeze_breakout:
-            bb_mid_dist = (price - bbm[-1]) / bbm[-1] if bbm[-1] > 0 else 0
-            if bb_mid_dist > 0.001:    votes.extend([1, 1])  # sterk signaal
-            elif bb_mid_dist < -0.001: votes.extend([-1, -1])
-            else:                      votes.append(0)
+        # Pullback + MACD
+        if trend_bull and -0.015 < dist_e21 < 0.005 and cr < 50:
+            base = 0.72 if macd_bull else 0.65
+            return 'long', min(base + adx_bonus, 0.90)
+        if trend_bear and -0.005 < dist_e21 < 0.015 and cr > 50:
+            base = 0.72 if macd_bear else 0.65
+            return 'short', min(base + adx_bonus, 0.90)
 
-        # 3. MACD crossover
-        if _prev(ml) <= _prev(sl_line) and ml[-1] > sl_line[-1]:  votes.append(1)
-        elif _prev(ml) >= _prev(sl_line) and ml[-1] < sl_line[-1]: votes.append(-1)
-        else: votes.append(0)
+        # RSI extreme in trend
+        if trend_bull and cr < 35:
+            return 'long', min(0.78 + adx_bonus, 0.90)
+        if trend_bear and cr > 65:
+            return 'short', min(0.78 + adx_bonus, 0.90)
 
-        # 4. MACD histogram richting
-        if len(hist) >= 2:
-            if hist[-1] > 0 and hist[-1] > hist[-2]:   votes.append(1)
-            elif hist[-1] < 0 and hist[-1] < hist[-2]: votes.append(-1)
-            else: votes.append(0)
+        # Trend-following fallback
+        if trend_bull and 40 < cr < 65 and cur_adx > 22:
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 > 0 and e21s > 0.0005:
+                return 'long', min(0.58 + adx_bonus, 0.72)
+        if trend_bear and 35 < cr < 60 and cur_adx > 22:
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 < 0 and e21s < -0.0005:
+                return 'short', min(0.58 + adx_bonus, 0.72)
 
-        # 5. OBV richting
-        obv_up = bool(obv_ema and len(obv_ema) >= 2 and obv_ema[-1] > obv_ema[-2])
-        if obv_up:                          votes.append(1)
-        elif obv_ema and len(obv_ema) >= 2: votes.append(-1)  # OBV daalt
-        else:                               votes.append(0)
-
-        # 6. RSI momentum
-        if cur_rsi > 45 and cur_rsi < 70 and cur_rsi > _prev(rv): votes.append(1)
-        elif cur_rsi < 55 and cur_rsi > 30 and cur_rsi < _prev(rv): votes.append(-1)
-        elif cur_rsi < 25:  votes.append(1)   # oversold bounce kans
-        elif cur_rsi > 75:  votes.append(-1)  # overbought
-        else: votes.append(0)
-
-        # 7. Prijs vs BB midden
-        if bbm and bbm[-1] > 0:
-            if price > bbm[-1]:   votes.append(1)
-            elif price < bbm[-1]: votes.append(-1)
-            else:                 votes.append(0)
-
-        sig, conf = self._active_score(votes)
-        THRESH = 0.55
-        return (sig, conf) if conf >= THRESH else ('none', 0.0)
+        return 'none', 0.0
 
     # ==========================================================================
     # XRP  --  4H ROI strategie: Trend pullback + BB extreme bounce
@@ -375,68 +375,57 @@ class TradingStrategy:
     # Confidence < 80% → vaste TP op 30% ROI
     # ==========================================================================
     def _signal_xrp(self, o: dict) -> Tuple[str, float]:
+        """XRP v3 — Dual mode: trend pullback + range mean-reversion."""
         c, h, l, v = o['closes'], o['highs'], o['lows'], o['volumes']
-
-        e21 = ema(c, 21); e50 = ema(c, 50)
-        rv  = rsi(c, 14)
+        e21 = ema(c, 21); e50 = ema(c, 50); rv = rsi(c, 14)
+        a = adx(h, l, c, 14)
         bbu, bbm, bbl = bollinger_bands(c, 20, 2.0)
 
-        if not all([e21, e50, rv, bbu]) or len(c) < 3 or len(rv) < 3:
+        if not all([e21, e50, rv, bbu]) or len(c) < 3:
             return 'none', 0.0
 
         price = c[-1]; cr = rv[-1]
-        e50s = _slope(e50, 10)
-
-        # ── TRIGGER A: Trend + Pullback (verruimd) ──
+        cur_adx = a[-1] if a else 15
+        dist_e21 = (price - e21[-1]) / e21[-1] if e21[-1] else 0
         trend_bull = e21[-1] > e50[-1]
         trend_bear = e21[-1] < e50[-1]
-        dist_e21 = (price - e21[-1]) / e21[-1] if e21[-1] else 0
 
-        # Long: uptrend + prijs binnen 1.5% van EMA21 + RSI < 50
+        # ══════ RANGE MODE (ADX < 25) ══════
+        if cur_adx < 25 and bbl and len(bbl) >= 2:
+            if price < bbl[-1] * 1.005 and cr < 35:
+                return 'long', 0.78 if cr < 28 else 0.68
+            if price > bbu[-1] * 0.995 and cr > 65:
+                return 'short', 0.78 if cr > 72 else 0.68
+            if cr < 25: return 'long', 0.82
+            if cr > 75: return 'short', 0.82
+
+        # ══════ TREND MODE ══════
+        # Trigger A: Pullback
         if trend_bull and -0.015 < dist_e21 < 0.005 and cr < 50:
-            base = 0.68
-            if cr < 30: base = 0.85       # sterke oversold
-            elif cr < 38: base = 0.78     # oversold
-            elif cr < 45: base = 0.72     # licht oversold
-            # Bearish candle = bonus, niet gate
+            base = 0.85 if cr < 30 else 0.78 if cr < 38 else 0.68
             if c[-1] < c[-2]: base += 0.03
             return 'long', min(base, 0.95)
-
-        # Short: downtrend + prijs binnen 1.5% van EMA21 + RSI > 50
         if trend_bear and -0.005 < dist_e21 < 0.015 and cr > 50:
-            base = 0.68
-            if cr > 70: base = 0.85
-            elif cr > 62: base = 0.78
-            elif cr > 55: base = 0.72
+            base = 0.85 if cr > 70 else 0.78 if cr > 62 else 0.68
             if c[-1] > c[-2]: base += 0.03
             return 'short', min(base, 0.95)
 
-        # ── TRIGGER B: BB bounce + RSI (verruimd: RSI < 35 ipv 28) ──
-        if len(bbl) >= 2:
-            prev_below = c[-2] < bbl[-2]
-            now_above  = price > bbl[-1]
-            prev_above = c[-2] > bbu[-2]
-            now_below  = price < bbu[-1]
+        # Trigger B: BB bounce
+        if bbl and len(bbl) >= 2:
+            if c[-2] < bbl[-2] and price > bbl[-1] and cr < 35:
+                return 'long', 0.88 if cr < 25 else 0.75
+            if c[-2] > bbu[-2] and price < bbu[-1] and cr > 65:
+                return 'short', 0.88 if cr > 75 else 0.75
 
-            if prev_below and now_above and cr < 35 and abs(e50s) > 0.001:
-                conf = 0.88 if cr < 25 else 0.75
-                return 'long', conf
-
-            if prev_above and now_below and cr > 65 and abs(e50s) > 0.001:
-                conf = 0.88 if cr > 75 else 0.75
-                return 'short', conf
-
-        # ── TRIGGER C: Trend-following (wanneer A en B niet vuren) ──
-        # EMA aligned + RSI niet extreem + prijs boven/onder EMA21
+        # Trigger C: Trend-following (verlaagde slope drempel)
         if trend_bull and 35 < cr < 60:
-            e21_slope = _slope(e21, 5)
-            if dist_e21 > 0 and e21_slope > 0.001:
-                return 'long', 0.65
-
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 > 0 and e21s > 0.0003:
+                return 'long', 0.62
         if trend_bear and 40 < cr < 65:
-            e21_slope = _slope(e21, 5)
-            if dist_e21 < 0 and e21_slope < -0.001:
-                return 'short', 0.65
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 < 0 and e21s < -0.0003:
+                return 'short', 0.62
 
         return 'none', 0.0
 
@@ -541,75 +530,62 @@ class TradingStrategy:
         return (sig, conf) if conf >= THRESH else ('none', 0.0)
 
     # ==========================================================================
-    # ADA  --  Supertrend + EMA + OBV + MACD (ADX als score, niet gate)
+    # ADA  --  Dual mode: Trend + Range (v2 — herschreven)
+    # Zelfde framework als BTC/ETH/XRP: ADX-based mode switch
     # ==========================================================================
     def _signal_ada(self, o: dict) -> Tuple[str, float]:
         c, h, l, v = o['closes'], o['highs'], o['lows'], o['volumes']
+        e21 = ema(c, 21); e50 = ema(c, 50); rv = rsi(c, 14)
+        a = adx(h, l, c, 14)
+        bbu, bbm, bbl = bollinger_bands(c, 20, 2.0)
 
-        from indicators import adx as _adx
-        e20 = ema(c, 20); e50 = ema(c, 50)
-        rv  = rsi(c, 14)
-        st_line, st_dir = supertrend(h, l, c, factor=3.0, period=10)
-        ovb = obv_slope(c, v, 14)
-        ml, sl_line, hist = macd(c, 12, 26, 9)
-
-        if not all([e20, e50, rv, st_line, st_dir, sl_line]):
+        if not all([e21, e50, rv, bbu]) or len(c) < 3:
             return 'none', 0.0
 
-        price   = c[-1]
-        cur_rsi = rv[-1]
-        cur_st  = st_dir[-1]
+        price = c[-1]; cr = rv[-1]
+        cur_adx = a[-1] if a else 15
+        dist_e21 = (price - e21[-1]) / e21[-1] if e21[-1] else 0
+        trend_bull = e21[-1] > e50[-1]
+        trend_bear = e21[-1] < e50[-1]
 
-        votes = []
+        # ══════ RANGE MODE (ADX < 25) ══════
+        if cur_adx < 25 and bbl and len(bbl) >= 2:
+            if price < bbl[-1] * 1.005 and cr < 35:
+                return 'long', 0.78 if cr < 28 else 0.68
+            if price > bbu[-1] * 0.995 and cr > 65:
+                return 'short', 0.78 if cr > 72 else 0.68
+            if cr < 25: return 'long', 0.82
+            if cr > 75: return 'short', 0.82
 
-        # 1. Supertrend richting (dubbel gewicht — kern indicator)
-        if cur_st == 1:    votes.extend([1, 1])
-        elif cur_st == -1: votes.extend([-1, -1])
-        else:              votes.append(0)
+        # ══════ TREND MODE ══════
+        if not trend_bull and not trend_bear:
+            return 'none', 0.0
 
-        # 2. Supertrend flip (extra bonus bij verse flip)
-        prev_st = _prev(st_dir, cur_st)
-        if prev_st == -1 and cur_st == 1:   votes.append(1)
-        elif prev_st == 1 and cur_st == -1: votes.append(-1)
-        # geen else — flip is puur bonus
+        adx_bonus = 0.05 if cur_adx > 30 else 0.0
 
-        # 3. EMA 20/50 alignment
-        if e20[-1] > e50[-1]:   votes.append(1)
-        elif e20[-1] < e50[-1]: votes.append(-1)
-        else:                   votes.append(0)
+        # Pullback
+        if trend_bull and -0.015 < dist_e21 < 0.005 and cr < 50:
+            base = 0.72 if cr < 40 else 0.65
+            return 'long', min(base + adx_bonus, 0.90)
+        if trend_bear and -0.005 < dist_e21 < 0.015 and cr > 50:
+            base = 0.72 if cr > 60 else 0.65
+            return 'short', min(base + adx_bonus, 0.90)
 
-        # 4. EMA 20 slope
-        e20_slope = _slope(e20, 5)
-        if e20_slope > 0.001:    votes.append(1)
-        elif e20_slope < -0.001: votes.append(-1)
-        else:                    votes.append(0)
+        # RSI extreme
+        if trend_bull and cr < 35: return 'long', 0.80
+        if trend_bear and cr > 65: return 'short', 0.80
 
-        # 5. OBV richting
-        if ovb > 0:    votes.append(1)
-        elif ovb < 0:  votes.append(-1)
-        else:          votes.append(0)
+        # Trend-following
+        if trend_bull and 40 < cr < 65 and cur_adx > 22:
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 > 0 and e21s > 0.0005:
+                return 'long', min(0.58 + adx_bonus, 0.72)
+        if trend_bear and 35 < cr < 60 and cur_adx > 22:
+            e21s = _slope(e21, 5) if len(e21) > 5 else 0
+            if dist_e21 < 0 and e21s < -0.0005:
+                return 'short', min(0.58 + adx_bonus, 0.72)
 
-        # 6. MACD histogram
-        if hist[-1] > 0:   votes.append(1)
-        elif hist[-1] < 0: votes.append(-1)
-        else:               votes.append(0)
-
-        # 7. RSI zone
-        if cur_rsi < 35:   votes.append(1)
-        elif cur_rsi > 65: votes.append(-1)
-        elif 40 < cur_rsi < 60: votes.append(0)  # neutrale zone
-        else:               votes.append(0)
-
-        # 8. ADX als bonus (trending = hogere confidence, niet als gate)
-        adx_vals = _adx(h, l, c, 14)
-        if adx_vals and adx_vals[-1] > 20:
-            # ADX bevestigt: voeg extra stem toe in dominante richting
-            if sum(v for v in votes if v != 0) > 0:  votes.append(1)
-            elif sum(v for v in votes if v != 0) < 0: votes.append(-1)
-
-        sig, conf = self._active_score(votes)
-        THRESH = 0.55
-        return (sig, conf) if conf >= THRESH else ('none', 0.0)
+        return 'none', 0.0
 
     # ==========================================================================
     # FARTCOIN BB  --  Bollinger Bands mean-reversion (4H) — v2
@@ -777,6 +753,24 @@ class TradingStrategy:
                                     )
                         except Exception as me:
                             logger.warning(f"[{contract}] Memory exit fout: {me}")
+                    # Telegram notificatie bij close
+                    if TG_ENABLED:
+                        try:
+                            lev = self.sl_tp.get(contract, {}).get('leverage', 1) or 1
+                            direction = 'long' if size > 0 else 'short'
+                            roi = pnl / (abs(size) / lev) * 100 if lev > 0 and size != 0 else 0
+                            await notify_close(contract, direction, pnl, roi, reason)
+                        except Exception:
+                            pass
+                    # Equity curve log
+                    if MEMORY_ENABLED:
+                        try:
+                            acc = await self.client.get_account()
+                            if acc:
+                                log_equity(float(acc.get('available', 0)), 'trade_close',
+                                           symbol=contract)
+                        except Exception:
+                            pass
                     self.sl_tp.pop(contract, None)
 
     async def run_cycle(self):
@@ -789,30 +783,91 @@ class TradingStrategy:
         logger.info(f"Balans: {balance:.4f} USDT")
         self.risk.reset_daily_if_needed(balance)
         if self.risk.is_daily_loss_exceeded(balance):
-            logger.warning("Dagverlies limiet bereikt  --  geen nieuwe trades")
+            logger.warning("Dagverlies limiet bereikt — geen nieuwe trades")
+            if TG_ENABLED:
+                await notify_alert("Daggrens", "Trading gepauzeerd.")
             return
+
+        # === BTC CORRELATIE CHECK ===
+        btc_bullish = None
+        try:
+            btc_raw = await self.client.get_candles('BTC_USDT', '4h', 60)
+            if btc_raw and len(btc_raw) >= 50:
+                btc_c = [float(c[4] if isinstance(c, list) else c.get('c', 0)) for c in btc_raw]
+                be21 = ema(btc_c, 21); be50 = ema(btc_c, 50)
+                if be21 and be50:
+                    btc_bullish = be21[-1] > be50[-1]
+                    logger.info(f"BTC trend: {'BULL' if btc_bullish else 'BEAR'}")
+        except Exception:
+            pass
+
         await self._manage_open_positions()
         all_pos = await self.client.get_positions()
-        open_contracts = {p['contract'] for p in all_pos if int(p.get('size', 0)) != 0}
+        open_contracts = set()
+
+        for p in all_pos:
+            size = int(p.get('size', 0))
+            if size == 0:
+                continue
+            contract = p['contract']
+            open_contracts.add(contract)
+
+            # === LIQUIDATIE CHECK ===
+            try:
+                liq = float(p.get('liq_price', 0))
+                mark = float(p.get('mark_price', 0))
+                if liq > 0 and mark > 0:
+                    dist = ((mark - liq) / mark * 100) if size > 0 else ((liq - mark) / mark * 100)
+                    if dist < 3:
+                        logger.warning(f"🚨 LIQUIDATIE [{contract}] {dist:.1f}% — auto-reduce!")
+                        await self.client.reduce_position(contract, 50)
+                        if TG_ENABLED:
+                            await notify_liquidation_warning(contract, liq, mark, dist)
+                    elif dist < 5:
+                        logger.warning(f"⚠ LIQUIDATIE [{contract}] {dist:.1f}%")
+                        if TG_ENABLED:
+                            await notify_alert("Liq risico", f"{contract}: {dist:.1f}%")
+            except Exception:
+                pass
+
+            # === FUNDING RATE LOG ===
+            try:
+                fr = await self.client.get_funding_rate(contract)
+                if fr and abs(fr['funding_rate']) > 0.0003:
+                    rate = fr['funding_rate']
+                    recv = (rate < 0 and size > 0) or (rate > 0 and size < 0)
+                    logger.info(f"[{contract}] Funding: {rate*100:.4f}% ({'✓' if recv else '✗'})")
+            except Exception:
+                pass
+
         logger.info(f"Open posities: {open_contracts or 'geen'}")
         for symbol in self.symbols:
             try:
                 if symbol in open_contracts:
                     continue
+
                 ohlcv = await self._fetch_ohlcv(symbol)
                 if not ohlcv:
                     logger.warning(f"[{symbol}] Onvoldoende candles")
                     continue
 
-                # Multi-TF: haal hogere timeframe data op voor trend filter
+                # Multi-TF trend data
                 trend_data = None
                 try:
                     trend_data = await self._fetch_trend_data(symbol)
                 except Exception as te:
-                    logger.debug(f"[{symbol}] Trend data ophalen mislukt: {te}")
-                    trend_data = None
+                    logger.debug(f"[{symbol}] Trend data mislukt: {te}")
 
                 signal, confidence = self.generate_signal(ohlcv, symbol, trend_data)
+
+                # BTC correlatie penalty op altcoins
+                if btc_bullish is not None and 'BTC' not in symbol:
+                    if signal == 'long' and not btc_bullish:
+                        confidence *= 0.7
+                        logger.info(f"[{symbol}] BTC bearish → long conf {confidence:.0%}")
+                    elif signal == 'short' and btc_bullish:
+                        confidence *= 0.8
+
                 price      = ohlcv['closes'][-1]
                 volatility = calculate_volatility_score(ohlcv['closes'])
                 interval   = ohlcv.get('interval', '?')
@@ -821,7 +876,7 @@ class TradingStrategy:
                     f"[{symbol}] {signal.upper():5} conf={confidence:.0%} "
                     f"prijs={price:.6f} vol={volatility:.2f} tf={interval}+{trend_tf}"
                 )
-                if signal == 'none':
+                if signal == 'none' or confidence < 0.45:
                     continue
                 atr_mult        = self._get_atr_multiplier(symbol)
                 tp_ratio        = self._get_tp_ratio(symbol)
@@ -829,7 +884,6 @@ class TradingStrategy:
                                             ohlcv['closes'], multiplier=atr_mult,
                                             tp_ratio=tp_ratio)
                 leverage = self.risk.get_optimal_leverage(volatility, sl_pct=sl_pct)
-                # Per-coin leverage cap
                 max_lev = COIN_MAX_LEVERAGE.get(symbol, 20)
                 leverage = min(leverage, max_lev)
                 lev_ok = await self.client.set_leverage(symbol, leverage)
@@ -866,7 +920,17 @@ class TradingStrategy:
                     f"TP={tp_price:.6f}[{'OK' if tp_ok else 'FAIL'}]"
                 )
 
-                # Trade memory: sla entry op
+                # Telegram notificatie
+                if TG_ENABLED:
+                    roi_tp = tp_pct * leverage * 100
+                    await notify_trade(symbol, signal, price, confidence, leverage,
+                                       sl_price, tp_price, roi_tp)
+
+                # Equity curve log
+                if MEMORY_ENABLED:
+                    log_equity(balance, 'trade_open', symbol=symbol)
+
+                # Trade memory
                 if MEMORY_ENABLED:
                     try:
                         snap    = build_snapshot(ohlcv, {'signal': signal, 'atr_mult': atr_mult})

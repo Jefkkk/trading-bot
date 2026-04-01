@@ -152,173 +152,98 @@ def _active_score(votes):
 
 
 def _sig_btc(c, h, l, v):
-    """BTC v2: Multi-TF trend + pullback. ADX soft gate, volume bonus."""
+    """BTC v3: Dual mode — trend + range auto-switch op ADX."""
     e21=ema(c,21); e50=ema(c,50); rv=rsi(c,14); a=adx(h,l,c,14)
+    bbu,bbm,bbl=bollinger_bands(c,20,2.0)
     if not all([e21,e50,rv]) or len(c)<3: return 'none',0.0
-
-    price=c[-1]; cr=rv[-1]; cur_adx=a[-1] if a else 0
-
-    # Trend
+    price=c[-1]; cr=rv[-1]; cur_adx=a[-1] if a else 15
     trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
-    if not trend_bull and not trend_bear: return 'none',0.0
-
-    # ADX soft gate
-    if cur_adx<20: return 'none',0.0
-    adx_bonus=0.05 if cur_adx>30 else 0.0
-
-    # Volume bonus
-    vol_bonus=0.0
-    if len(v)>=20:
-        avg_vol=sum(v[-20:])/20
-        if avg_vol>0 and v[-1]>avg_vol*1.5: vol_bonus=0.05
-
     dist_e21=(price-e21[-1])/e21[-1] if e21[-1] else 0
-
-    # Trigger A: EMA pullback
+    # RANGE MODE
+    if cur_adx<25 and bbu and bbl and len(bbl)>=2:
+        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
+        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
+        if cr<25: return 'long', 0.82
+        if cr>75: return 'short', 0.82
+    # TREND MODE
+    if not trend_bull and not trend_bear: return 'none',0.0
+    ab=0.05 if cur_adx>30 else 0.0
     if trend_bull and -0.015<dist_e21<0.005 and cr<50:
-        base=0.70
-        if cr<35: base=0.82
-        elif cr<40: base=0.75
-        if c[-1]<c[-2]: base+=0.03
-        return 'long', min(base+adx_bonus+vol_bonus, 0.95)
-
+        return 'long', min((0.72 if cr<40 else 0.65)+ab, 0.90)
     if trend_bear and -0.005<dist_e21<0.015 and cr>50:
-        base=0.70
-        if cr>65: base=0.82
-        elif cr>60: base=0.75
-        if c[-1]>c[-2]: base+=0.03
-        return 'short', min(base+adx_bonus+vol_bonus, 0.95)
-
-    # Trigger B: RSI extreme
-    if trend_bull and cr<35:
-        return 'long', min(0.80+adx_bonus+vol_bonus, 0.95)
-    if trend_bear and cr>65:
-        return 'short', min(0.80+adx_bonus+vol_bonus, 0.95)
-
-    # Trigger C: Trend-following (wanneer A en B niet vuren)
-    if trend_bull and 40<cr<65 and cur_adx>25:
-        e21s=_slope(e21,5)
-        if dist_e21>0 and e21s>0.001:
-            return 'long', min(0.62+adx_bonus+vol_bonus, 0.78)
-    if trend_bear and 35<cr<60 and cur_adx>25:
-        e21s=_slope(e21,5)
-        if dist_e21<0 and e21s<-0.001:
-            return 'short', min(0.62+adx_bonus+vol_bonus, 0.78)
-
+        return 'short', min((0.72 if cr>60 else 0.65)+ab, 0.90)
+    if trend_bull and cr<35: return 'long', min(0.80+ab, 0.92)
+    if trend_bear and cr>65: return 'short', min(0.80+ab, 0.92)
+    if trend_bull and 40<cr<65 and cur_adx>22:
+        if dist_e21>0 and _slope(e21,5)>0.0005: return 'long', min(0.60+ab, 0.75)
+    if trend_bear and 35<cr<60 and cur_adx>22:
+        if dist_e21<0 and _slope(e21,5)<-0.0005: return 'short', min(0.60+ab, 0.75)
     return 'none',0.0
 
 
 def _sig_eth(c, h, l, v):
-    e9=ema(c,9); e21=ema(c,21); e50=ema(c,50)
+    """ETH v2: Dual mode — trend + range."""
+    e21=ema(c,21); e50=ema(c,50); rv=rsi(c,14); a=adx(h,l,c,14)
+    bbu,bbm,bbl=bollinger_bands(c,20,2.0)
     ml,sl,hist=macd(c,12,26,9)
-    bbu,bbm,bbl=bollinger_bands(c,20,2.0)
-    bb_w=bollinger_width(c,20); rv=rsi(c,14)
-    obv_v=obv(c,v); obv_e=ema(obv_v,10) if len(obv_v)>=10 else []
-    if not all([e9,e21,e50,sl,bbu,bb_w,rv]): return 'none',0.0
-
-    price=c[-1]; cr=rv[-1]
-
-    # Squeeze detectie (bonus)
-    ref_n=min(30,len(bb_w))
-    avg_w=sum(bb_w[-ref_n:])/ref_n
-    in_sq=bb_w[-1]<avg_w*0.80
-    was_sq=len(bb_w)>8 and min(bb_w[-9:-1])<avg_w*0.80
-    squeeze_bo=was_sq and not in_sq
-
-    votes=[]
-
-    # 1. EMA trend (dubbel gewicht)
-    if e9[-1]>e21[-1]>e50[-1]: votes.extend([1,1])
-    elif e9[-1]<e21[-1]<e50[-1]: votes.extend([-1,-1])
-    else: votes.append(0)
-
-    # 2. Squeeze breakout bonus
-    if squeeze_bo:
-        bd=(price-bbm[-1])/bbm[-1] if bbm[-1]>0 else 0
-        if bd>0.001: votes.extend([1,1])
-        elif bd<-0.001: votes.extend([-1,-1])
-        else: votes.append(0)
-
-    # 3. MACD crossover
-    if _p(ml)<=_p(sl) and ml[-1]>sl[-1]: votes.append(1)
-    elif _p(ml)>=_p(sl) and ml[-1]<sl[-1]: votes.append(-1)
-    else: votes.append(0)
-
-    # 4. MACD histogram
-    if len(hist)>=2:
-        if hist[-1]>0 and hist[-1]>hist[-2]: votes.append(1)
-        elif hist[-1]<0 and hist[-1]<hist[-2]: votes.append(-1)
-        else: votes.append(0)
-
-    # 5. OBV richting
-    obv_up=bool(obv_e and len(obv_e)>=2 and obv_e[-1]>obv_e[-2])
-    if obv_up: votes.append(1)
-    elif obv_e and len(obv_e)>=2: votes.append(-1)
-    else: votes.append(0)
-
-    # 6. RSI momentum
-    if cr>45 and cr<70 and cr>_p(rv): votes.append(1)
-    elif cr<55 and cr>30 and cr<_p(rv): votes.append(-1)
-    elif cr<25: votes.append(1)
-    elif cr>75: votes.append(-1)
-    else: votes.append(0)
-
-    # 7. Prijs vs BB midden
-    if bbm and bbm[-1]>0:
-        if price>bbm[-1]: votes.append(1)
-        elif price<bbm[-1]: votes.append(-1)
-        else: votes.append(0)
-
-    sig,conf=_active_score(votes)
-    return (sig,conf) if conf>=0.55 else ('none',0.0)
-
-
-def _sig_xrp(c, h, l, v):
-    """XRP v2: Pullback + BB bounce, verruimde drempels."""
-    e21=ema(c,21); e50=ema(c,50); rv=rsi(c,14)
-    bbu,bbm,bbl=bollinger_bands(c,20,2.0)
-    if not all([e21,e50,rv,bbu]) or len(c)<3 or len(rv)<3: return 'none',0.0
-
-    price=c[-1]; cr=rv[-1]; e50s=_slope(e50,10)
-    trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
+    if not all([e21,e50,rv,bbu]) or len(c)<3: return 'none',0.0
+    price=c[-1]; cr=rv[-1]; cur_adx=a[-1] if a else 15
     dist_e21=(price-e21[-1])/e21[-1] if e21[-1] else 0
-
-    # Trigger A: EMA pullback (verruimd)
+    trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
+    # RANGE MODE
+    if cur_adx<25 and bbl and len(bbl)>=2:
+        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
+        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
+        if cr<25: return 'long', 0.82
+        if cr>75: return 'short', 0.82
+    # TREND MODE
+    if not trend_bull and not trend_bear: return 'none',0.0
+    ab=0.05 if cur_adx>30 else 0.0
+    macd_b=sl and len(ml)>=2 and ml[-2]<=sl[-2] and ml[-1]>sl[-1]
+    macd_s=sl and len(ml)>=2 and ml[-2]>=sl[-2] and ml[-1]<sl[-1]
     if trend_bull and -0.015<dist_e21<0.005 and cr<50:
-        base=0.68
-        if cr<30: base=0.85
-        elif cr<38: base=0.78
-        elif cr<45: base=0.72
-        if c[-1]<c[-2]: base+=0.03
-        return 'long', min(base, 0.95)
-
+        return 'long', min((0.72 if macd_b else 0.65)+ab, 0.90)
     if trend_bear and -0.005<dist_e21<0.015 and cr>50:
-        base=0.68
-        if cr>70: base=0.85
-        elif cr>62: base=0.78
-        elif cr>55: base=0.72
-        if c[-1]>c[-2]: base+=0.03
-        return 'short', min(base, 0.95)
-
-    # Trigger B: BB bounce (verruimd RSI < 35 ipv 28)
-    if len(bbl)>=2:
-        if c[-2]<bbl[-2] and price>bbl[-1] and cr<35 and abs(e50s)>0.001:
-            return 'long', 0.88 if cr<25 else 0.75
-        if c[-2]>bbu[-2] and price<bbu[-1] and cr>65 and abs(e50s)>0.001:
-            return 'short', 0.88 if cr>75 else 0.75
-
-    # Trigger C: Trend-following
-    if trend_bull and 35<cr<60:
-        e21s=_slope(e21,5)
-        if dist_e21>0 and e21s>0.001:
-            return 'long', 0.65
-    if trend_bear and 40<cr<65:
-        e21s=_slope(e21,5)
-        if dist_e21<0 and e21s<-0.001:
-            return 'short', 0.65
-
+        return 'short', min((0.72 if macd_s else 0.65)+ab, 0.90)
+    if trend_bull and cr<35: return 'long', min(0.78+ab, 0.90)
+    if trend_bear and cr>65: return 'short', min(0.78+ab, 0.90)
+    if trend_bull and 40<cr<65 and cur_adx>22:
+        if dist_e21>0 and _slope(e21,5)>0.0005: return 'long', min(0.58+ab, 0.72)
+    if trend_bear and 35<cr<60 and cur_adx>22:
+        if dist_e21<0 and _slope(e21,5)<-0.0005: return 'short', min(0.58+ab, 0.72)
     return 'none',0.0
 
+def _sig_xrp(c, h, l, v):
+    """XRP v3: Dual mode — trend pullback + range mean-reversion."""
+    e21=ema(c,21); e50=ema(c,50); rv=rsi(c,14); a=adx(h,l,c,14)
+    bbu,bbm,bbl=bollinger_bands(c,20,2.0)
+    if not all([e21,e50,rv,bbu]) or len(c)<3: return 'none',0.0
+    price=c[-1]; cr=rv[-1]; cur_adx=a[-1] if a else 15
+    dist_e21=(price-e21[-1])/e21[-1] if e21[-1] else 0
+    trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
+    # RANGE MODE
+    if cur_adx<25 and bbl and len(bbl)>=2:
+        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
+        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
+        if cr<25: return 'long', 0.82
+        if cr>75: return 'short', 0.82
+    # TREND MODE
+    if trend_bull and -0.015<dist_e21<0.005 and cr<50:
+        base=0.85 if cr<30 else 0.78 if cr<38 else 0.68
+        if c[-1]<c[-2]: base+=0.03
+        return 'long', min(base, 0.95)
+    if trend_bear and -0.005<dist_e21<0.015 and cr>50:
+        base=0.85 if cr>70 else 0.78 if cr>62 else 0.68
+        if c[-1]>c[-2]: base+=0.03
+        return 'short', min(base, 0.95)
+    if bbl and len(bbl)>=2:
+        if c[-2]<bbl[-2] and price>bbl[-1] and cr<35: return 'long', 0.88 if cr<25 else 0.75
+        if c[-2]>bbu[-2] and price<bbu[-1] and cr>65: return 'short', 0.88 if cr>75 else 0.75
+    if trend_bull and 35<cr<60:
+        if dist_e21>0 and _slope(e21,5)>0.0003: return 'long', 0.62
+    if trend_bear and 40<cr<65:
+        if dist_e21<0 and _slope(e21,5)<-0.0003: return 'short', 0.62
+    return 'none',0.0
 
 def _sig_fartcoin(c, h, l, v):
     """FARTCOIN: Trend + Dip entry. 3 hard gates → alleen hoge kwaliteit trades."""
@@ -391,107 +316,33 @@ def _sig_fartcoin(c, h, l, v):
 
 
 def _sig_ada(c, h, l, v):
-    e20=ema(c,20); e50=ema(c,50); rv=rsi(c,14)
-    st_l,st_d=supertrend(h,l,c,3.0,10)
-    ovb=obv_slope(c,v,14); ml,sl,hist=macd(c,12,26,9)
-    if not all([e20,e50,rv,st_l,st_d,sl]): return 'none',0.0
-
-    price=c[-1]; cr=rv[-1]; cur_st=st_d[-1]
-    votes=[]
-
-    # 1. Supertrend (dubbel gewicht)
-    if cur_st==1: votes.extend([1,1])
-    elif cur_st==-1: votes.extend([-1,-1])
-    else: votes.append(0)
-
-    # 2. Supertrend flip bonus
-    prev_st=_p(st_d,cur_st)
-    if prev_st==-1 and cur_st==1: votes.append(1)
-    elif prev_st==1 and cur_st==-1: votes.append(-1)
-
-    # 3. EMA 20/50
-    if e20[-1]>e50[-1]: votes.append(1)
-    elif e20[-1]<e50[-1]: votes.append(-1)
-    else: votes.append(0)
-
-    # 4. EMA 20 slope
-    e20s=_slope(e20,5)
-    if e20s>0.001: votes.append(1)
-    elif e20s<-0.001: votes.append(-1)
-    else: votes.append(0)
-
-    # 5. OBV
-    if ovb>0: votes.append(1)
-    elif ovb<0: votes.append(-1)
-    else: votes.append(0)
-
-    # 6. MACD histogram
-    if hist[-1]>0: votes.append(1)
-    elif hist[-1]<0: votes.append(-1)
-    else: votes.append(0)
-
-    # 7. RSI zone
-    if cr<35: votes.append(1)
-    elif cr>65: votes.append(-1)
-    else: votes.append(0)
-
-    # 8. ADX bonus
-    cur_adx=_adx_last(h,l,c,14)
-    if cur_adx>20:
-        dominant=sum(x for x in votes if x!=0)
-        if dominant>0: votes.append(1)
-        elif dominant<0: votes.append(-1)
-
-    sig,conf=_active_score(votes)
-    return (sig,conf) if conf>=0.55 else ('none',0.0)
-
-
-def _sig_consensus(c, h, l, v):
-    """Algemeen consensus met active scoring."""
-    e9=ema(c,9); e21=ema(c,21); e50=ema(c,50)
-    rv=rsi(c,14); ml,sl,hist=macd(c,12,26,9)
-    _,bbm,_=bollinger_bands(c,20); sk,sd=stochastic(h,l,c,14,3)
-    vw=vwap(h,l,c,v)
-    if not all([e9,e21,e50,rv,sl,bbm,sk,sd,vw]): return 'none',0.0
-
-    price=c[-1]; cr=rv[-1]
-    votes=[]
-
-    if e9[-1]>e21[-1]>e50[-1]: votes.extend([1,1])
-    elif e9[-1]<e21[-1]<e50[-1]: votes.extend([-1,-1])
-    else: votes.append(0)
-
-    if _p(ml)<=_p(sl) and ml[-1]>sl[-1]: votes.append(1)
-    elif _p(ml)>=_p(sl) and ml[-1]<sl[-1]: votes.append(-1)
-    else: votes.append(0)
-
-    if len(hist)>=2:
-        if hist[-1]>0 and hist[-1]>hist[-2]: votes.append(1)
-        elif hist[-1]<0 and hist[-1]<hist[-2]: votes.append(-1)
-        else: votes.append(0)
-
-    if cr<30: votes.append(1)
-    elif cr>70: votes.append(-1)
-    elif cr>50 and cr>_p(rv): votes.append(1)
-    elif cr<50 and cr<_p(rv): votes.append(-1)
-    else: votes.append(0)
-
-    if price>vw[-1]: votes.append(1)
-    elif price<vw[-1]: votes.append(-1)
-    else: votes.append(0)
-
-    psk=_p(sk,sk[-1])
-    if sk[-1]<30 and sk[-1]>psk: votes.append(1)
-    elif sk[-1]>70 and sk[-1]<psk: votes.append(-1)
-    else: votes.append(0)
-
-    if bbm and price>bbm[-1]: votes.append(1)
-    elif bbm and price<bbm[-1]: votes.append(-1)
-    else: votes.append(0)
-
-    sig,conf=_active_score(votes)
-    return (sig,conf) if conf>=0.55 else ('none',0.0)
-
+    """ADA v2: Dual mode — trend + range."""
+    e21=ema(c,21); e50=ema(c,50); rv=rsi(c,14); a=adx(h,l,c,14)
+    bbu,bbm,bbl=bollinger_bands(c,20,2.0)
+    if not all([e21,e50,rv,bbu]) or len(c)<3: return 'none',0.0
+    price=c[-1]; cr=rv[-1]; cur_adx=a[-1] if a else 15
+    dist_e21=(price-e21[-1])/e21[-1] if e21[-1] else 0
+    trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
+    # RANGE MODE
+    if cur_adx<25 and bbl and len(bbl)>=2:
+        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
+        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
+        if cr<25: return 'long', 0.82
+        if cr>75: return 'short', 0.82
+    # TREND MODE
+    if not trend_bull and not trend_bear: return 'none',0.0
+    ab=0.05 if cur_adx>30 else 0.0
+    if trend_bull and -0.015<dist_e21<0.005 and cr<50:
+        return 'long', min((0.72 if cr<40 else 0.65)+ab, 0.90)
+    if trend_bear and -0.005<dist_e21<0.015 and cr>50:
+        return 'short', min((0.72 if cr>60 else 0.65)+ab, 0.90)
+    if trend_bull and cr<35: return 'long', 0.80
+    if trend_bear and cr>65: return 'short', 0.80
+    if trend_bull and 40<cr<65 and cur_adx>22:
+        if dist_e21>0 and _slope(e21,5)>0.0005: return 'long', min(0.58+ab, 0.72)
+    if trend_bear and 35<cr<60 and cur_adx>22:
+        if dist_e21<0 and _slope(e21,5)<-0.0005: return 'short', min(0.58+ab, 0.72)
+    return 'none',0.0
 
 def _sig_fartcoin_bb(c, h, l, v):
     """
@@ -596,7 +447,7 @@ STRATEGIES = {
     'fartcoin_momentum': _sig_fartcoin,
     'fartcoin_bb':       _sig_fartcoin_bb,
     'ada_supertrend':    _sig_ada,
-    'general_consensus': _sig_consensus,
+    'general_consensus': _sig_btc,  # consensus verwijderd, BTC als default
     'rsi_meanrev':       _sig_rsi_meanrev,
     'ema_crossover':     _sig_ema_cross,
     'bb_bounce':         _sig_bb_bounce,
@@ -680,7 +531,7 @@ class Backtester:
         self.trail_roi_conf    = trail_roi_conf
         self.trail_roi_distance = trail_roi_distance / 100.0
 
-        self._sig   = STRATEGIES.get(strategy, _sig_consensus)
+        self._sig   = STRATEGIES.get(strategy, _sig_btc)
         tf_base = TF_BASE_MULTIPLIERS.get(interval, 3.0)
         coin_f  = COIN_FACTORS.get(strategy, 1.0)
         self._amult = round(tf_base * coin_f, 1)

@@ -225,6 +225,38 @@ class GateFuturesClient:
         )
         return result or []
 
+    async def get_funding_rate(self, contract: str) -> Optional[dict]:
+        """Haal huidige funding rate op. Rate > 0 = longs betalen, < 0 = shorts betalen."""
+        session = await self._get_session()
+        url = f"{BASE_URL}/api/v4/futures/{self.settle}/contracts/{contract}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        'funding_rate':      float(data.get('funding_rate', 0)),
+                        'funding_next_apply': int(data.get('funding_next_apply', 0)),
+                        'mark_price':        float(data.get('mark_price', 0)),
+                        'index_price':       float(data.get('index_price', 0)),
+                    }
+        except Exception as e:
+            logger.error(f"Funding rate [{contract}]: {e}")
+        return None
+
+    async def reduce_position(self, contract: str, reduce_pct: float = 50) -> Optional[dict]:
+        """Verklein een open positie met X%. Gebruikt voor liquidatie-bescherming."""
+        pos = await self.get_position(contract)
+        if not pos or int(pos.get('size', 0)) == 0:
+            return None
+        size = int(pos['size'])
+        reduce_size = -int(abs(size) * reduce_pct / 100)
+        if size < 0:
+            reduce_size = abs(reduce_size)
+        if reduce_size == 0:
+            return None
+        logger.warning(f"REDUCE [{contract}]: {reduce_pct}% ({reduce_size} contracts)")
+        return await self.place_order(contract, reduce_size, reduce_only=True)
+
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()

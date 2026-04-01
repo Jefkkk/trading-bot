@@ -224,6 +224,53 @@ def bot_status():
 
 # --- Live Data ---------------------------------------------------------------
 
+@app.route('/api/equity_curve')
+def api_equity_curve():
+    """Equity curve voor dashboard chart."""
+    days = int(request.args.get('days', 30))
+    try:
+        from trade_memory import get_equity_curve
+        return jsonify(get_equity_curve(days))
+    except Exception as e:
+        return jsonify([])
+
+@app.route('/api/trade_diary')
+def api_trade_diary():
+    """Trade dagboek met alle details."""
+    limit = int(request.args.get('limit', 50))
+    symbol = request.args.get('symbol', None)
+    try:
+        from trade_memory import get_trade_diary
+        return jsonify(get_trade_diary(limit, symbol))
+    except Exception as e:
+        return jsonify([])
+
+@app.route('/api/performance')
+def api_performance():
+    """Wekelijks/maandelijks performance rapport."""
+    days = int(request.args.get('days', 7))
+    try:
+        from trade_memory import get_performance_summary
+        return jsonify(get_performance_summary(days))
+    except Exception as e:
+        return jsonify({'trades': 0})
+
+@app.route('/api/funding/<symbol>')
+def api_funding(symbol):
+    """Funding rate ophalen voor een contract."""
+    import requests as req
+    try:
+        url = f'https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol}'
+        r = req.get(url, timeout=10)
+        data = r.json()
+        return jsonify({
+            'funding_rate': float(data.get('funding_rate', 0)),
+            'next_apply': int(data.get('funding_next_apply', 0)),
+            'mark_price': float(data.get('mark_price', 0)),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/ticker/<symbol>')
 def get_ticker(symbol):
     import requests as req

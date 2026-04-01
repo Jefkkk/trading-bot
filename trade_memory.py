@@ -88,6 +88,15 @@ def init_db():
             action        TEXT,
             notes         TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS equity_curve (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts         TEXT    NOT NULL,
+            balance    REAL    NOT NULL,
+            event      TEXT,           -- 'trade_close' / 'funding' / 'snapshot'
+            trade_id   INTEGER,
+            symbol     TEXT
+        );
         """)
     logger.info("Trade memory DB geïnitialiseerd")
 
@@ -456,15 +465,117 @@ def get_daily_trade_count() -> int:
 def check_daily_limit(balance: float, max_loss_pct: float = 5.0) -> tuple:
     """
     Check of de dagelijkse verliesgrens bereikt is.
-    
     Returns: (is_blocked, daily_pnl, daily_pct, reason)
     """
     daily_pnl = get_daily_pnl()
     daily_pct = (daily_pnl / balance * 100) if balance > 0 else 0
-    
+
     if daily_pct <= -max_loss_pct:
         reason = f"Daggrens bereikt: {daily_pct:.1f}% (limiet: -{max_loss_pct}%)"
         logger.warning(f"🛑 {reason}")
         return True, daily_pnl, daily_pct, reason
-    
+
     return False, daily_pnl, daily_pct, ""
+
+
+# --- Equity Curve tracking --------------------------------------------------
+
+def log_equity(balance: float, event: str = 'snapshot',
+               trade_id: int = None, symbol: str = None):
+    """Log een equity punt (na elke trade of periodiek)."""
+    ts = datetime.now(TZ).isoformat()
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO equity_curve (ts, balance, event, trade_id, symbol) VALUES (?,?,?,?,?)",
+                (ts, balance, event, trade_id, symbol)
+            )
+    except Exception as e:
+        logger.debug(f"Equity log fout: {e}")
+
+
+def get_equity_curve(days: int = 30) -> list:
+    """Haal equity curve op van de laatste N dagen."""
+    cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT ts, balance, event, symbol FROM equity_curve WHERE ts > ? ORDER BY ts",
+                (cutoff,)
+            ).fetchall()
+        return [{'ts': r[0], 'balance': r[1], 'event': r[2], 'symbol': r[3]} for r in rows]
+    except:
+        return []
+
+
+# --- Trade Dagboek -----------------------------------------------------------
+
+def get_trade_diary(limit: int = 50, symbol: str = None) -> list:
+    """Haal trades op voor het dagboek met alle details."""
+    try:
+        with _db() as conn:
+            if symbol:
+                rows = conn.execute(
+                    """SELECT id, symbol, strategy, direction, entry_price, exit_price,
+                              entry_ts, exit_ts, exit_reason, pnl, pnl_pct,
+                              contracts, leverage, confidence, snapshot, market_regime
+                       FROM trades WHERE closed=1 AND symbol=?
+                       ORDER BY exit_ts DESC LIMIT ?""",
+                    (symbol, limit)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, symbol, strategy, direction, entry_price, exit_price,
+                              entry_ts, exit_ts, exit_reason, pnl, pnl_pct,
+                              contracts, leverage, confidence, snapshot, market_regime
+                       FROM trades WHERE closed=1
+                       ORDER BY exit_ts DESC LIMIT ?""",
+                    (limit,)
+                ).fetchall()
+        return [dict(r) for r in rows]
+    except:
+        return []
+
+
+def get_performance_summary(days: int = 7) -> dict:
+    """Wekelijks/maandelijks performance rapport."""
+    cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
+    try:
+        with _db() as conn:
+            trades = conn.execute(
+                "SELECT * FROM trades WHERE closed=1 AND exit_ts > ?", (cutoff,)
+            ).fetchall()
+        if not trades:
+            return {'period_days': days, 'trades': 0}
+
+        total = len(trades)
+        wins = sum(1 for t in trades if (t['pnl'] or 0) > 0)
+        total_pnl = sum(t['pnl'] or 0 for t in trades)
+        best = max(t['pnl'] or 0 for t in trades)
+        worst = min(t['pnl'] or 0 for t in trades)
+
+        # Per coin breakdown
+        by_coin = {}
+        for t in trades:
+            sym = t['symbol']
+            if sym not in by_coin:
+                by_coin[sym] = {'trades': 0, 'wins': 0, 'pnl': 0}
+            by_coin[sym]['trades'] += 1
+            if (t['pnl'] or 0) > 0:
+                by_coin[sym]['wins'] += 1
+            by_coin[sym]['pnl'] += t['pnl'] or 0
+
+        return {
+            'period_days': days,
+            'trades': total,
+            'wins': wins,
+            'win_rate': round(wins / total * 100, 1) if total else 0,
+            'total_pnl': round(total_pnl, 4),
+            'best_trade': round(best, 4),
+            'worst_trade': round(worst, 4),
+            'avg_pnl': round(total_pnl / total, 4) if total else 0,
+            'by_coin': {k: {**v, 'wr': round(v['wins']/v['trades']*100,1) if v['trades'] else 0}
+                        for k, v in by_coin.items()},
+        }
+    except:
+        return {'period_days': days, 'trades': 0}
