@@ -223,6 +223,8 @@ def bot_status():
         'last_trade_at':        bot_state['last_trade_at'],
         'last_trade_ago':       last_trade_ago,
         'stalled':              stalled,
+        'dry_run':              os.environ.get('DRY_RUN', '').lower() in ('true', '1', 'yes'),
+        'auto_start':           os.environ.get('AUTO_START', 'true').lower() in ('true', '1', 'yes'),
     })
 
 # --- Live Data ---------------------------------------------------------------
@@ -317,6 +319,158 @@ def get_account():
 
 # --- Backtesting -------------------------------------------------------------
 
+def fetch_historical_candles(symbol, interval, from_ts, to_ts):
+    """
+    Haal historische candles op van Gate.io public API.
+    Geen API key nodig. Max 2000 per request, auto-chunking.
+    """
+    import requests as req
+    url = 'https://api.gateio.ws/api/v4/futures/usdt/candlesticks'
+    
+    # Interval in seconden voor chunking
+    interval_secs = {
+        '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
+        '1h': 3600, '4h': 14400, '8h': 28800, '1d': 86400,
+    }.get(interval, 3600)
+    
+    all_candles = []
+    chunk_size = 2000  # Gate.io max per request
+    current = from_ts
+    
+    while current < to_ts:
+        chunk_end = min(current + chunk_size * interval_secs, to_ts)
+        try:
+            r = req.get(url, params={
+                'contract': symbol,
+                'interval': interval,
+                'from': int(current),
+                'to': int(chunk_end),
+            }, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                all_candles.extend(data)
+            logger.info(f"Fetched {len(data or [])} candles for {symbol} "
+                        f"({interval}) chunk {current}-{chunk_end}")
+        except Exception as e:
+            logger.error(f"Fetch error {symbol}: {e}")
+            break
+        current = chunk_end
+        import time; time.sleep(0.3)  # rate limiting
+    
+    # Dedup op timestamp
+    seen = set()
+    unique = []
+    for c in all_candles:
+        ts = c[0] if isinstance(c, list) else c.get('t', 0)
+        if ts not in seen:
+            seen.add(ts)
+            unique.append(c)
+    
+    unique.sort(key=lambda c: c[0] if isinstance(c, list) else c.get('t', 0))
+    return unique
+
+
+@app.route('/api/backtest/real', methods=['POST'])
+def run_backtest_real():
+    """
+    Backtest op ECHTE Gate.io historische data.
+    Haalt automatisch candles op voor de opgegeven periode.
+    """
+    body = request.json or {}
+    symbol   = body.get('symbol', 'BTC_USDT')
+    interval = body.get('interval', '4h')
+    balance  = float(body.get('balance', 10))
+    strategy = body.get('strategy', 'btc_trend')
+    
+    # Datums: default 1 jan 2026 tot nu
+    date_from = body.get('date_from', '2026-01-01')
+    date_to   = body.get('date_to', '')
+    
+    from datetime import datetime as dt
+    try:
+        from_ts = int(dt.strptime(date_from, '%Y-%m-%d').timestamp())
+    except:
+        from_ts = int(dt(2026, 1, 1).timestamp())
+    
+    if date_to:
+        try:
+            to_ts = int(dt.strptime(date_to, '%Y-%m-%d').timestamp())
+        except:
+            to_ts = int(datetime.now(TZ).timestamp())
+    else:
+        to_ts = int(datetime.now(TZ).timestamp())
+    
+    # Parameters
+    fee_pct = float(body.get('fee_pct', 0.075))
+    slippage = float(body.get('slippage_pct', 0.05))
+    leverage = int(body.get('leverage', 20))
+    
+    if strategy not in STRATEGIES:
+        strategy = 'btc_trend'
+    
+    try:
+        logger.info(f"Real backtest: {symbol} {interval} {date_from}→{date_to or 'nu'} strat={strategy}")
+        candles = fetch_historical_candles(symbol, interval, from_ts, to_ts)
+        candles = normalize_candles(candles) if candles else []
+    except Exception as e:
+        return jsonify({'error': f'Data ophalen mislukt: {str(e)}'}), 400
+    
+    if len(candles) < 100:
+        return jsonify({'error': f'Te weinig data: {len(candles)} candles (min 100)'}), 400
+    
+    logger.info(f"Fetched {len(candles)} echte candles voor {symbol}")
+    
+    bt = Backtester(
+        initial_balance=balance, strategy=strategy, interval=interval,
+        fee_pct=fee_pct, slippage_pct=slippage, max_leverage=leverage,
+        use_atr_sl=True,
+    )
+    result = bt.run(candles, symbol)
+    
+    trades_json = [
+        {
+            'direction': t.direction, 'entry_price': t.entry_price,
+            'entry_ts': t.entry_ts, 'exit_price': t.exit_price,
+            'exit_ts': t.exit_ts, 'pnl': round(t.pnl, 4),
+            'pnl_pct': round(t.pnl_pct, 2), 'exit_reason': t.exit_reason,
+            'leverage': t.leverage, 'confidence': round(t.confidence, 2),
+        }
+        for t in result.trades
+    ]
+    
+    eq = result.equity_curve
+    ts = result.timestamps
+    step = max(1, len(eq) // 300)
+    
+    return jsonify({
+        'real_data': True,
+        'candles_fetched': len(candles),
+        'symbol': result.symbol,
+        'strategy': result.strategy,
+        'interval': interval,
+        'period_from': result.period_from,
+        'period_to': result.period_to,
+        'total_trades': result.total_trades,
+        'win_rate': round(result.win_rate, 1),
+        'win_count': result.win_count,
+        'loss_count': result.loss_count,
+        'total_pnl': round(result.total_pnl, 4),
+        'return_pct': round(result.return_pct, 2),
+        'profit_factor': round(result.profit_factor, 2) if result.profit_factor != float('inf') else 999,
+        'max_drawdown': round(result.max_drawdown, 2),
+        'sharpe_ratio': round(result.sharpe_ratio, 2),
+        'initial_balance': result.initial_balance,
+        'final_balance': round(result.final_balance, 4),
+        'total_fees': round(result.total_fees, 4),
+        'avg_trade_pct': round(result.avg_trade_pct, 2),
+        'best_trade': round(result.best_trade, 4),
+        'worst_trade': round(result.worst_trade, 4),
+        'equity_curve': eq[::step],
+        'equity_ts': ts[::step] if len(ts) >= len(eq) else [],
+        'trades': trades_json,
+    })
+
 @app.route('/api/strategies')
 def get_strategies():
     """Geef lijst van beschikbare strategieën."""
@@ -394,6 +548,7 @@ def run_backtest():
         use_atr_sl=True,
         interval=interval,
         fee_pct=fee_pct,
+        slippage_pct=0.05,
         cooldown_bars=cooldown_bars,
         max_hold_bars=max_hold_bars,
         direction_filter=direction_filter,
@@ -1206,6 +1361,7 @@ input[type=date]{color-scheme:light}
       <span>Laatste trade: <b id="health-trade">—</b></span>
       <span>Fouten: <b id="health-errors">0</b></span>
       <span id="health-stalled" style="display:none;color:var(--yellow);font-weight:600">⚠ Bot reageert niet</span>
+      <span id="health-paper" style="display:none;color:var(--blue);font-weight:600;background:rgba(0,122,255,.12);padding:2px 8px;border-radius:4px">📝 PAPER MODE</span>
       <span id="health-last-error" style="display:none;color:var(--red);font-size:11px"></span>
     </div>
   </div>
@@ -1516,7 +1672,15 @@ input[type=date]{color-scheme:light}
         <div class="field"><label>&nbsp;</label><button class="btn btn-ghost btn-sm" onclick="clearDates()">Wis</button></div>
       </div>
     </div>
-    <button class="btn btn-primary" id="btn-bt" onclick="runBacktest()">Run Backtest</button>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="btn-bt" onclick="runBacktest()">Run Backtest (recent)</button>
+      <button class="btn btn-long" id="btn-bt-real" onclick="runRealBacktest()" style="font-weight:600">
+        ⚡ Backtest Echte Data (Gate.io)
+      </button>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text3)">
+      "Recent" gebruikt de laatste N candles. "Echte Data" haalt de volledige periode op van Gate.io (geen API key nodig).
+    </div>
   </div>
 
   <div id="bt-loading" class="loading" style="display:none"><div class="spinner"></div>Backtest berekenen...</div>
@@ -1758,7 +1922,14 @@ async function pollStatus() {
     document.getElementById('stat-trades').textContent=d.trade_count||0;
     document.getElementById('stat-pos').textContent=(d.positions||[]).length;
     if(d.last_cycle) document.getElementById('last-cycle-label').textContent='Laatste cyclus: '+new Date(d.last_cycle).toLocaleTimeString('nl-BE');
-    if(!d.running){
+
+    // === FIX: ALTIJD knoppen syncen met werkelijke status ===
+    if(d.running){
+      document.getElementById('btn-start').disabled=true;
+      document.getElementById('btn-stop').disabled=false;
+      // Polling moet draaien als bot draait
+      if(!pollTimer){startPoll();}
+    } else {
       document.getElementById('btn-start').disabled=false;
       document.getElementById('btn-stop').disabled=true;
       if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
@@ -1784,6 +1955,10 @@ async function pollStatus() {
 
     const stalledEl = document.getElementById('health-stalled');
     stalledEl.style.display = d.stalled ? 'inline' : 'none';
+
+    // Paper trading badge
+    const paperEl = document.getElementById('health-paper');
+    if(paperEl) paperEl.style.display = d.dry_run ? 'inline' : 'none';
 
     const errEl = document.getElementById('health-last-error');
     if(d.last_error) {
@@ -2300,6 +2475,47 @@ function filterTrades() {
   renderTradesTable(trades);
 }
 
+async function runRealBacktest() {
+  const btn=document.getElementById('btn-bt-real');
+  btn.disabled=true; btn.textContent='⏳ Data ophalen van Gate.io...';
+  document.getElementById('bt-results').style.display='none';
+  document.getElementById('bt-loading').style.display='flex';
+  document.getElementById('bt-loading').querySelector('.spinner').nextSibling.textContent=
+    'Echte marktdata ophalen van Gate.io + backtest berekenen...';
+
+  const dateFrom = document.getElementById('bt-from').value || '2026-01-01';
+  const dateTo   = document.getElementById('bt-to').value   || new Date().toISOString().split('T')[0];
+  const body = {
+    symbol:   document.getElementById('bt-sym').value,
+    strategy: document.getElementById('bt-strat').value,
+    interval: document.getElementById('bt-interval').value,
+    balance:  parseFloat(document.getElementById('bt-bal').value),
+    date_from: dateFrom,
+    date_to:   dateTo,
+    fee_pct:       parseFloat(document.getElementById('bt-fee').value),
+    slippage_pct:  0.05,
+    leverage:      20,
+  };
+
+  try {
+    const r = await fetch('/api/backtest/real', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if(d.error) { toast(d.error, 'err'); return; }
+    allBtTrades = d.trades || [];
+    toast(`✓ ${d.candles_fetched} echte candles geladen`, 'ok');
+    renderBacktest(d);
+  } catch(e) { toast('Fout: '+e.message, 'err'); }
+  finally {
+    btn.disabled=false;
+    btn.textContent='⚡ Backtest Echte Data (Gate.io)';
+    document.getElementById('bt-loading').style.display='none';
+  }
+}
+
 function renderTradesTable(trades) {
   document.getElementById('bt-trade-count').textContent = trades.length + ' trades';
   document.getElementById('bt-trades').innerHTML = trades.map((t,i) => {
@@ -2534,7 +2750,11 @@ window.addEventListener('DOMContentLoaded',()=>{
   loadTickers();
   loadPriceChart('BTC_USDT','chart-btc','#007aff');
   loadPriceChart('ETH_USDT','chart-eth','#34c759');
-  pollStatus();
+
+  // === FIX: Altijd polling starten bij pagina laden ===
+  // Eerste poll synct knoppen + status, daarna elke 8s
+  startPoll();
+
   loadBalanceOverview();
   setInterval(loadTickers, 30000);
   setInterval(loadBalanceOverview, 15000);
@@ -2550,6 +2770,10 @@ window.addEventListener('DOMContentLoaded',()=>{
   }
   tickClock();
   setInterval(tickClock, 1000);
+
+  // Default datums voor backtest: 1 jan 2026 tot vandaag
+  if(!document.getElementById('bt-from').value) document.getElementById('bt-from').value='2026-01-01';
+  if(!document.getElementById('bt-to').value) document.getElementById('bt-to').value=new Date().toISOString().split('T')[0];
 });
 </script>
 </body>
@@ -2561,6 +2785,26 @@ window.addEventListener('DOMContentLoaded',()=>{
 @app.route('/')
 def index():
     return HTML_PAGE
+
+# === AUTO-START: bot automatisch starten bij server boot ===
+def _auto_start_bot():
+    """Start de bot automatisch als AUTO_START=true (of altijd als geen API keys ontbreken check)."""
+    auto = os.environ.get('AUTO_START', 'true').lower() in ('true', '1', 'yes')
+    has_keys = bool(os.environ.get('GATE_API_KEY')) and bool(os.environ.get('GATE_API_SECRET'))
+    if auto and has_keys and not bot_state['running']:
+        logger.info("🚀 AUTO-START: bot wordt automatisch gestart")
+        bot_state['running'] = True
+        bot_state['cycle_count'] = 0
+        bot_state['error_count'] = 0
+        bot_state['started_at'] = datetime.now(TZ).isoformat()
+        t = threading.Thread(target=bot_loop, daemon=True)
+        t.start()
+        bot_state['thread'] = t
+    elif auto and not has_keys:
+        logger.warning("AUTO-START: overgeslagen — GATE_API_KEY/SECRET niet geconfigureerd")
+
+# Auto-start bij import (wanneer main.py dit bestand importeert)
+_auto_start_bot()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

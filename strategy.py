@@ -251,11 +251,11 @@ class TradingStrategy:
         # Mean-reversion: koop bij lower BB + RSI oversold, verkoop bij upper BB + overbought
         if cur_adx < 25 and bbu and bbl and len(bbl) >= 2:
             # Long: prijs raakt/doorbreekt lower BB + RSI laag
-            if price < bbl[-1] * 1.005 and cr < 35:
+            if len(bbl) >= 2 and c[-2] < bbl[-2] and price > bbl[-1] and cr < 40:
                 conf = 0.78 if cr < 28 else 0.68
                 return 'long', conf
             # Short: prijs raakt upper BB + RSI hoog
-            if price > bbu[-1] * 0.995 and cr > 65:
+            if len(bbu) >= 2 and c[-2] > bbu[-2] and price < bbu[-1] and cr > 60:
                 conf = 0.78 if cr > 72 else 0.68
                 return 'short', conf
             # RSI extreme bounce (zeldzamer maar sterker)
@@ -321,14 +321,13 @@ class TradingStrategy:
 
         # ══════ RANGE MODE (ADX < 25) ══════
         if cur_adx < 25 and bbl and len(bbl) >= 2:
-            if price < bbl[-1] * 1.005 and cr < 35:
+            if len(bbl) >= 2 and c[-2] < bbl[-2] and price > bbl[-1] and cr < 40:
                 conf = 0.78 if cr < 28 else 0.68
                 return 'long', conf
-            if price > bbu[-1] * 0.995 and cr > 65:
+            if len(bbu) >= 2 and c[-2] > bbu[-2] and price < bbu[-1] and cr > 60:
                 conf = 0.78 if cr > 72 else 0.68
                 return 'short', conf
-            if cr < 25: return 'long', 0.82
-            if cr > 75: return 'short', 0.82
+            # RSI < 25 / > 75 verwijderd: verliespatroon (WR 23%)
 
         # ══════ TREND MODE ══════
         if not trend_bull and not trend_bear:
@@ -395,12 +394,11 @@ class TradingStrategy:
 
         # ══════ RANGE MODE (ADX < 25) ══════
         if cur_adx < 25 and bbl and len(bbl) >= 2:
-            if price < bbl[-1] * 1.005 and cr < 35:
+            if len(bbl) >= 2 and c[-2] < bbl[-2] and price > bbl[-1] and cr < 40:
                 return 'long', 0.78 if cr < 28 else 0.68
-            if price > bbu[-1] * 0.995 and cr > 65:
+            if len(bbu) >= 2 and c[-2] > bbu[-2] and price < bbu[-1] and cr > 60:
                 return 'short', 0.78 if cr > 72 else 0.68
-            if cr < 25: return 'long', 0.82
-            if cr > 75: return 'short', 0.82
+            # RSI < 25 / > 75 verwijderd: verliespatroon (WR 23%)
 
         # ══════ TREND MODE ══════
         # Trigger A: Pullback
@@ -553,12 +551,11 @@ class TradingStrategy:
 
         # ══════ RANGE MODE (ADX < 25) ══════
         if cur_adx < 25 and bbl and len(bbl) >= 2:
-            if price < bbl[-1] * 1.005 and cr < 35:
+            if len(bbl) >= 2 and c[-2] < bbl[-2] and price > bbl[-1] and cr < 40:
                 return 'long', 0.78 if cr < 28 else 0.68
-            if price > bbu[-1] * 0.995 and cr > 65:
+            if len(bbu) >= 2 and c[-2] > bbu[-2] and price < bbu[-1] and cr > 60:
                 return 'short', 0.78 if cr > 72 else 0.68
-            if cr < 25: return 'long', 0.82
-            if cr > 75: return 'short', 0.82
+            # RSI < 25 / > 75 verwijderd: verliespatroon (WR 23%)
 
         # ══════ TREND MODE ══════
         if not trend_bull and not trend_bear:
@@ -662,6 +659,10 @@ class TradingStrategy:
                     )
                     return 'none', 0.0
 
+            # === VERLIESFILTER: blokkeer historisch verliesgevende patronen ===
+            if sig != 'none':
+                sig, conf = self._loss_filter(ohlcv, sig, conf)
+
             return sig, conf
         except Exception as e:
             logger.error(f"Signaal fout [{symbol}]: {e}", exc_info=True)
@@ -708,6 +709,65 @@ class TradingStrategy:
             '4h':  1.5,
             '1d':  1.5,
         }.get(interval, 1.2)
+
+    def _loss_filter(self, ohlcv: dict, sig: str, conf: float) -> Tuple[str, float]:
+        """
+        VERLIESFILTER — gebaseerd op analyse van 20.000+ verliezende trades.
+        Blokkeert trades die historisch verliesgevend zijn.
+        
+        6 filters:
+        1. RSI extremen (< 25 of > 75) → vallend mes
+        2. Tegen de EMA trend → counter-trend verliest
+        3. Onder lower BB (long) → prijs valt door
+        4. ADX 20-25 = niemandsland → geen edge
+        5. Confidence > 82% = overconfident
+        6. Prijs > 2% van EMA21 → te ver uitgerekt
+        """
+        c = ohlcv['closes']; h = ohlcv['highs']; l = ohlcv['lows']
+        rv = rsi(c, 14)
+        e21 = ema(c, 21); e50 = ema(c, 50)
+        a = adx(h, l, c, 14)
+        bbu, bbm, bbl = bollinger_bands(c, 20, 2.0)
+        
+        cr = rv[-1] if rv else 50
+        cur_adx = a[-1] if a else 15
+        
+        # Filter 1: RSI extremen — grootste verliezer (WR 23% bij RSI<25)
+        if cr < 25 or cr > 75:
+            logger.debug(f"Loss filter: RSI extreme ({cr:.0f})")
+            return 'none', 0.0
+        
+        # Filter 2: VERWIJDERD — blokkeerde range-mode mean-reversion trades
+        # Range mode is bewust counter-trend, dat is het hele punt
+        
+        # Filter 3: Onder lower BB = vallend mes (WR 34%)
+        if sig == 'long' and bbl and c[-1] < bbl[-1]:
+            logger.debug(f"Loss filter: long onder lower BB")
+            return 'none', 0.0
+        if sig == 'short' and bbu and c[-1] > bbu[-1]:
+            logger.debug(f"Loss filter: short boven upper BB")
+            return 'none', 0.0
+        
+        # Filter 4: ADX niemandsland (20-25) — geen edge
+        if 20 <= cur_adx <= 25:
+            logger.debug(f"Loss filter: ADX niemandsland ({cur_adx:.0f})")
+            return 'none', 0.0
+        
+        # Filter 5: Overconfident (conf > 82% → WR daalt)
+        if conf > 0.82:
+            conf = 0.82
+        
+        # Filter 6: Te ver van EMA21
+        if e21 and e21[-1] > 0:
+            dist = (c[-1] - e21[-1]) / e21[-1]
+            if sig == 'long' and dist < -0.02:
+                logger.debug(f"Loss filter: long te ver onder EMA21 ({dist*100:.1f}%)")
+                return 'none', 0.0
+            if sig == 'short' and dist > 0.02:
+                logger.debug(f"Loss filter: short te ver boven EMA21 ({dist*100:.1f}%)")
+                return 'none', 0.0
+        
+        return sig, conf
 
     async def _manage_open_positions(self):
         positions = await self.client.get_positions()

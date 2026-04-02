@@ -161,10 +161,9 @@ def _sig_btc(c, h, l, v):
     dist_e21=(price-e21[-1])/e21[-1] if e21[-1] else 0
     # RANGE MODE
     if cur_adx<25 and bbu and bbl and len(bbl)>=2:
-        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
-        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
-        if cr<25: return 'long', 0.82
-        if cr>75: return 'short', 0.82
+        if len(bbl)>=2 and c[-2]<bbl[-2] and price>bbl[-1] and cr<40: return 'long', 0.80 if cr<25 else 0.70
+        if len(bbu)>=2 and c[-2]>bbu[-2] and price<bbu[-1] and cr>60: return 'short', 0.80 if cr>75 else 0.70
+        # RSI extreme verwijderd (verliespatroon)
     # TREND MODE
     if not trend_bull and not trend_bear: return 'none',0.0
     ab=0.05 if cur_adx>30 else 0.0
@@ -192,10 +191,9 @@ def _sig_eth(c, h, l, v):
     trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
     # RANGE MODE
     if cur_adx<25 and bbl and len(bbl)>=2:
-        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
-        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
-        if cr<25: return 'long', 0.82
-        if cr>75: return 'short', 0.82
+        if len(bbl)>=2 and c[-2]<bbl[-2] and price>bbl[-1] and cr<40: return 'long', 0.80 if cr<25 else 0.70
+        if len(bbu)>=2 and c[-2]>bbu[-2] and price<bbu[-1] and cr>60: return 'short', 0.80 if cr>75 else 0.70
+        # RSI extreme verwijderd (verliespatroon)
     # TREND MODE
     if not trend_bull and not trend_bear: return 'none',0.0
     ab=0.05 if cur_adx>30 else 0.0
@@ -223,10 +221,9 @@ def _sig_xrp(c, h, l, v):
     trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
     # RANGE MODE
     if cur_adx<25 and bbl and len(bbl)>=2:
-        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
-        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
-        if cr<25: return 'long', 0.82
-        if cr>75: return 'short', 0.82
+        if len(bbl)>=2 and c[-2]<bbl[-2] and price>bbl[-1] and cr<40: return 'long', 0.80 if cr<25 else 0.70
+        if len(bbu)>=2 and c[-2]>bbu[-2] and price<bbu[-1] and cr>60: return 'short', 0.80 if cr>75 else 0.70
+        # RSI extreme verwijderd (verliespatroon)
     # TREND MODE
     if trend_bull and -0.015<dist_e21<0.005 and cr<50:
         base=0.85 if cr<30 else 0.78 if cr<38 else 0.68
@@ -325,10 +322,9 @@ def _sig_ada(c, h, l, v):
     trend_bull=e21[-1]>e50[-1]; trend_bear=e21[-1]<e50[-1]
     # RANGE MODE
     if cur_adx<25 and bbl and len(bbl)>=2:
-        if price<bbl[-1] and cr<30: return 'long', 0.80 if cr<25 else 0.70
-        if price>bbu[-1] and cr>70: return 'short', 0.80 if cr>75 else 0.70
-        if cr<25: return 'long', 0.82
-        if cr>75: return 'short', 0.82
+        if len(bbl)>=2 and c[-2]<bbl[-2] and price>bbl[-1] and cr<40: return 'long', 0.80 if cr<25 else 0.70
+        if len(bbu)>=2 and c[-2]>bbu[-2] and price<bbu[-1] and cr>60: return 'short', 0.80 if cr>75 else 0.70
+        # RSI extreme verwijderd (verliespatroon)
     # TREND MODE
     if not trend_bull and not trend_bear: return 'none',0.0
     ab=0.05 if cur_adx>30 else 0.0
@@ -728,6 +724,30 @@ class Backtester:
                 result.equity_curve.append(balance); result.timestamps.append(ts); continue
 
             sig,conf=self._sig(C[:i+1],H[:i+1],L[:i+1],V[:i+1])
+
+            # === VERLIESFILTER (gebaseerd op analyse van 20K+ trades) ===
+            if sig != 'none':
+                _rv = rsi(C[:i+1], 14)
+                _cr = _rv[-1] if _rv else 50
+                _a = adx(H[:i+1], L[:i+1], C[:i+1], 14)
+                _adx = _a[-1] if _a else 15
+                _e21 = ema(C[:i+1], 21); _e50 = ema(C[:i+1], 50)
+                _bbu, _bbm, _bbl = bollinger_bands(C[:i+1], 20, 2.0)
+                # Filter 1: RSI extremen
+                if _cr < 25 or _cr > 75: sig = 'none'
+                # Filter 2: VERWIJDERD (blokkeerde goede range-mode trades)
+                # Filter 3: Onder BB = vallend mes
+                if sig == 'long' and _bbl and C[i] < _bbl[-1]: sig = 'none'
+                if sig == 'short' and _bbu and C[i] > _bbu[-1]: sig = 'none'
+                # Filter 4: ADX niemandsland
+                if 20 <= _adx <= 25: sig = 'none'
+                # Filter 5: Overconfident
+                if conf > 0.82: conf = 0.82
+                # Filter 6: Te ver van EMA21
+                if _e21 and _e21[-1] > 0:
+                    _d = (C[i] - _e21[-1]) / _e21[-1]
+                    if sig == 'long' and _d < -0.02: sig = 'none'
+                    if sig == 'short' and _d > 0.02: sig = 'none'
 
             # Direction filter
             if sig=='long' and self.direction_filter=='short_only': sig='none'
