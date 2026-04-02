@@ -109,12 +109,15 @@ def _trend_strength(e_fast, e_slow) -> float:
 
 class TradingStrategy:
     def __init__(self, client: GateFuturesClient, risk: RiskManager,
-                 symbols: List[str]):
+                 symbols: List[str], dry_run: bool = False):
         self.client  = client
         self.risk    = risk
         self.symbols = symbols
+        self.dry_run = dry_run  # Paper trading: log alles maar geen echte orders
         self.sl_tp:    Dict[str, dict] = {}
-        self.trade_ids: Dict[str, int]  = {}   # symbol -> memory trade_id
+        self.trade_ids: Dict[str, int]  = {}
+        if dry_run:
+            logger.info("📝 PAPER TRADING MODE — geen echte orders")
 
     async def _balance(self) -> float:
         acc = await self.client.get_account()
@@ -728,6 +731,42 @@ class TradingStrategy:
             sl, tp  = sl_tp['sl'], sl_tp['tp']
             hit_sl  = (mark <= sl) if is_long else (mark >= sl)
             hit_tp  = (mark >= tp) if is_long else (mark <= tp)
+
+            # === TRAILING STOP: verplaats SL mee als prijs gunstig beweegt ===
+            if not hit_sl and not hit_tp:
+                entry = sl_tp.get('entry', mark)
+                # Bereken hoeveel de prijs gunstig bewogen is
+                if is_long:
+                    favorable = (mark - entry) / entry if entry > 0 else 0
+                else:
+                    favorable = (entry - mark) / entry if entry > 0 else 0
+                # Na 1% gunstige beweging: verplaats SL naar break-even
+                if favorable > 0.01 and ((is_long and sl < entry) or (not is_long and sl > entry)):
+                    new_sl = entry  # break-even
+                    self.sl_tp[contract]['sl'] = new_sl
+                    logger.info(f"[{contract}] Trailing SL → break-even: {new_sl:.6f}")
+                    # Update op exchange
+                    try:
+                        await self.client.cancel_all_price_orders(contract)
+                        await self.client.place_stop_loss(contract, is_long, new_sl, abs(size))
+                        await self.client.place_take_profit(contract, is_long, tp, abs(size))
+                    except Exception:
+                        pass
+                # Na 2% gunstige beweging: lock 50% van winst
+                elif favorable > 0.02:
+                    lock_pct = favorable * 0.5
+                    new_sl = entry * (1 + lock_pct) if is_long else entry * (1 - lock_pct)
+                    if (is_long and new_sl > sl) or (not is_long and new_sl < sl):
+                        self.sl_tp[contract]['sl'] = new_sl
+                        logger.info(f"[{contract}] Trailing SL → profit lock: {new_sl:.6f} ({lock_pct*100:.1f}%)")
+                        try:
+                            await self.client.cancel_all_price_orders(contract)
+                            await self.client.place_stop_loss(contract, is_long, new_sl, abs(size))
+                            await self.client.place_take_profit(contract, is_long, tp, abs(size))
+                        except Exception:
+                            pass
+                continue
+
             if hit_sl or hit_tp:
                 reason = "SL" if hit_sl else "TP"
                 logger.info(f"[{contract}] Software {reason}: mark={mark:.6f} pnl={pnl:+.4f}")
@@ -782,6 +821,15 @@ class TradingStrategy:
             return
         logger.info(f"Balans: {balance:.4f} USDT")
         self.risk.reset_daily_if_needed(balance)
+
+        # === DRAWDOWN CIRCUIT BREAKER ===
+        if self.risk.check_drawdown(balance):
+            logger.warning("🚨 CIRCUIT BREAKER — drawdown limiet bereikt, geen trading")
+            if TG_ENABLED:
+                await notify_alert("Circuit Breaker",
+                    f"Drawdown > {self.risk.max_drawdown_pct:.0%}. Alle trading gestopt.")
+            return
+
         if self.risk.is_daily_loss_exceeded(balance):
             logger.warning("Dagverlies limiet bereikt — geen nieuwe trades")
             if TG_ENABLED:
@@ -841,6 +889,12 @@ class TradingStrategy:
                 pass
 
         logger.info(f"Open posities: {open_contracts or 'geen'}")
+
+        # === MAX POSITIES CHECK ===
+        if not self.risk.can_open_position(len(open_contracts)):
+            logger.info("Geen nieuwe trades: max posities of circuit breaker")
+            return
+
         for symbol in self.symbols:
             try:
                 if symbol in open_contracts:
@@ -903,8 +957,38 @@ class TradingStrategy:
                     f"[{symbol}] ORDER {signal.upper()} | "
                     f"contracts={contracts} lev={leverage}x "
                     f"sl={sl_pct:.1%} tp={tp_pct:.1%}"
+                    f"{' [PAPER]' if self.dry_run else ''}"
                 )
-                result = await self.client.place_order(symbol, order_size)
+
+                # === PAPER TRADING MODE ===
+                if self.dry_run:
+                    logger.info(f"[{symbol}] 📝 PAPER TRADE — niet uitgevoerd")
+                    # Log als echte trade in memory voor tracking
+                    if MEMORY_ENABLED:
+                        try:
+                            snap = build_snapshot(ohlcv, {'signal': signal, 'atr_mult': atr_mult})
+                            regime = detect_regime(snap)
+                            trade_id = log_entry(
+                                symbol=symbol, strategy=symbol.split('_')[0].lower(),
+                                direction=signal, entry_price=price,
+                                contracts=contracts, leverage=leverage,
+                                confidence=confidence, snapshot=snap,
+                                market_regime=regime,
+                            )
+                            self.trade_ids[symbol] = trade_id
+                            logger.info(f"[{symbol}] Paper trade #{trade_id} gelogd")
+                        except Exception:
+                            pass
+                    continue
+
+                # === ORDER EXECUTIE MET RETRY ===
+                result = None
+                for attempt in range(3):
+                    result = await self.client.place_order(symbol, order_size)
+                    if result:
+                        break
+                    logger.warning(f"[{symbol}] Order poging {attempt+1}/3 mislukt, retry...")
+                    await asyncio.sleep(1)
                 if not result:
                     logger.error(f"[{symbol}] Order mislukt: {self.client.last_error}")
                     continue
@@ -913,7 +997,10 @@ class TradingStrategy:
                 await self.client.cancel_all_price_orders(symbol)
                 sl_ok = await self.client.place_stop_loss(symbol, is_long, sl_price, contracts)
                 tp_ok = await self.client.place_take_profit(symbol, is_long, tp_price, contracts)
-                self.sl_tp[symbol] = {'sl': sl_price, 'tp': tp_price, 'is_long': is_long, 'leverage': leverage}
+                self.sl_tp[symbol] = {
+                    'sl': sl_price, 'tp': tp_price, 'is_long': is_long,
+                    'leverage': leverage, 'entry': price,
+                }
                 logger.info(
                     f"[{symbol}] OK entry~{price:.6f} "
                     f"SL={sl_price:.6f}[{'OK' if sl_ok else 'FAIL'}] "

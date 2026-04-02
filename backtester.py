@@ -494,6 +494,7 @@ class Backtester:
                  strategy='general_consensus', use_atr_sl=True, interval='1h',
                  # === NIEUWE PARAMETERS ===
                  fee_pct=0.075,          # taker fee per trade (0.075% = Gate.io default)
+                 slippage_pct=0.05,     # slippage per trade (0.05% = realistisch)
                  cooldown_bars=3,        # bars wachten na trade-exit
                  max_hold_bars=0,        # 0 = onbeperkt, >0 = sluit na N bars
                  direction_filter='both', # 'both', 'long_only', 'short_only'
@@ -517,6 +518,7 @@ class Backtester:
         self.use_atr_sl       = use_atr_sl
         self.interval         = interval
         self.fee_pct          = fee_pct / 100.0  # opslaan als decimaal
+        self.slippage_pct     = slippage_pct / 100.0  # slippage per trade
         self.cooldown_bars    = cooldown_bars
         self.max_hold_bars    = max_hold_bars
         self.direction_filter = direction_filter
@@ -567,9 +569,9 @@ class Backtester:
         return min(c_pct, c_cap)
 
     def _calc_fee(self, contracts, price):
-        """Bereken taker fee voor entry of exit."""
+        """Bereken taker fee + slippage voor entry of exit."""
         notional = contracts  # Gate.io: 1 contract = 1 USD notional
-        return notional * self.fee_pct
+        return notional * (self.fee_pct + self.slippage_pct)
 
     def run(self, candles, symbol, date_from=None, date_to=None):
         def _f(c,k,d=0.0):

@@ -10,12 +10,14 @@ class RiskManager:
         self,
         max_leverage:       int   = 20,
         risk_per_trade:     float = 0.02,
-        max_trade_usd:      float = 3.0,    # Harde cap: max $3 margin per trade
-        max_total_exposure: float = 0.50,   # Max 50% van balans tegelijk in markt
-        stop_loss_pct:      float = 0.20,   # 20% SL (ruimer, minder noise stops)
-        take_profit_pct:    float = 0.30,   # 30% TP (1:1.5 R/R)
-        max_daily_loss_usd: float = 5.0,    # Stop bij $5 dagverlies
-        max_daily_loss_pct: float = 0.20,   # Of bij 20% van balans (wat eerst bereikt wordt)
+        max_trade_usd:      float = 3.0,
+        max_total_exposure: float = 0.50,
+        stop_loss_pct:      float = 0.20,
+        take_profit_pct:    float = 0.30,
+        max_daily_loss_usd: float = 5.0,
+        max_daily_loss_pct: float = 0.20,
+        max_drawdown_pct:   float = 0.10,   # Circuit breaker: stop bij -10%
+        max_concurrent_pos: int   = 3,       # Max 3 gelijktijdige posities
     ):
         self.max_leverage        = max_leverage
         self.risk_per_trade      = risk_per_trade
@@ -25,11 +27,15 @@ class RiskManager:
         self.take_profit_pct     = take_profit_pct
         self.max_daily_loss_usd  = max_daily_loss_usd
         self.max_daily_loss_pct  = max_daily_loss_pct
+        self.max_drawdown_pct    = max_drawdown_pct
+        self.max_concurrent_pos  = max_concurrent_pos
 
         self.daily_pnl           = 0.0
         self.daily_start_balance = 0.0
         self.last_reset_date     = date.today()
         self.trade_count_today   = 0
+        self.peak_balance        = 0.0      # Hoogste balans ooit (voor drawdown)
+        self.circuit_breaker     = False     # True = alles gestopt
 
     def reset_daily_if_needed(self, balance: float):
         today = date.today()
@@ -151,3 +157,73 @@ class RiskManager:
             f"PnL: {pnl:+.4f} | dag={self.daily_pnl:+.4f} USDT | "
             f"trades={self.trade_count_today}"
         )
+
+    def update_peak_balance(self, balance: float):
+        """Track hoogste balans voor drawdown berekening."""
+        if balance > self.peak_balance:
+            self.peak_balance = balance
+
+    def check_drawdown(self, balance: float) -> bool:
+        """
+        Circuit breaker: stop ALLE trading als drawdown > max_drawdown_pct.
+        Returns True als trading geblokkeerd moet worden.
+        """
+        if self.peak_balance <= 0:
+            self.peak_balance = balance
+            return False
+        self.update_peak_balance(balance)
+        drawdown = (self.peak_balance - balance) / self.peak_balance
+        if drawdown >= self.max_drawdown_pct:
+            if not self.circuit_breaker:
+                logger.warning(
+                    f"🚨 CIRCUIT BREAKER: drawdown {drawdown:.1%} >= {self.max_drawdown_pct:.0%} "
+                    f"(peak=${self.peak_balance:.2f} → ${balance:.2f})"
+                )
+                self.circuit_breaker = True
+            return True
+        return False
+
+    def can_open_position(self, current_open: int) -> bool:
+        """Check of er ruimte is voor een nieuwe positie."""
+        if self.circuit_breaker:
+            logger.warning("Circuit breaker actief — geen nieuwe trades")
+            return False
+        if current_open >= self.max_concurrent_pos:
+            logger.info(f"Max posities bereikt ({current_open}/{self.max_concurrent_pos})")
+            return False
+        return True
+
+    def get_trailing_stop(self, entry: float, current: float, is_long: bool,
+                          atr_value: float, atr_mult: float = 1.5) -> float:
+        """
+        ATR-gebaseerde trailing stop.
+        - Long: stop = current_price - ATR * mult (stijgt mee, daalt nooit)
+        - Short: stop = current_price + ATR * mult (daalt mee, stijgt nooit)
+        """
+        trail_dist = atr_value * atr_mult
+        if is_long:
+            return max(entry * 0.95, current - trail_dist)  # nooit lager dan -5% van entry
+        else:
+            return min(entry * 1.05, current + trail_dist)
+
+    def get_partial_tp_levels(self, entry: float, is_long: bool,
+                              sl_pct: float) -> list:
+        """
+        Partial take-profit ladder:
+        - 50% sluiten bij 1.5× risk (1:1.5 R/R)
+        - 25% sluiten bij 3× risk (1:3 R/R)
+        - 25% laten lopen met trailing stop
+        """
+        r1 = sl_pct * 1.5  # 1:1.5 risk/reward
+        r2 = sl_pct * 3.0  # 1:3 risk/reward
+        if is_long:
+            tp1 = round(entry * (1 + r1), 8)
+            tp2 = round(entry * (1 + r2), 8)
+        else:
+            tp1 = round(entry * (1 - r1), 8)
+            tp2 = round(entry * (1 - r2), 8)
+        return [
+            {'pct': 0.50, 'price': tp1, 'label': '1.5R'},
+            {'pct': 0.25, 'price': tp2, 'label': '3R'},
+            # Resterende 25% trailing stop
+        ]

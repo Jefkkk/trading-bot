@@ -42,6 +42,9 @@ async def main():
         raise SystemExit("GATE_API_KEY en GATE_API_SECRET zijn vereist")
 
     logger.info(f"Jef Bot gestart | symbolen: {SYMBOLS} | cyclus: {CYCLE_SECONDS}s")
+    dry_run = os.environ.get('DRY_RUN', '').lower() in ('true', '1', 'yes')
+    if dry_run:
+        logger.info("📝 PAPER TRADING MODE — geen echte orders worden geplaatst")
     client = GateFuturesClient(api_key, api_secret)
     risk   = RiskManager(
         max_leverage       = 20,
@@ -53,7 +56,7 @@ async def main():
         max_daily_loss_usd = 5.0,
         max_daily_loss_pct = 0.20,
     )
-    strat  = TradingStrategy(client, risk, SYMBOLS)
+    strat  = TradingStrategy(client, risk, SYMBOLS, dry_run=dry_run)
     started = datetime.now(TZ)
     cycle_count = 0
     error_count = 0

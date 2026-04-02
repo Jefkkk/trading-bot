@@ -82,6 +82,7 @@ def get_client():
 def bot_loop():
     async def _run():
         client = get_client()
+        dry_run = os.environ.get('DRY_RUN', '').lower() in ('true', '1', 'yes')
         risk = RiskManager(
             max_leverage       = 20,
             risk_per_trade     = 0.02,
@@ -91,8 +92,10 @@ def bot_loop():
             take_profit_pct    = 0.30,
             max_daily_loss_usd = 5.0,
             max_daily_loss_pct = 0.20,
+            max_drawdown_pct   = 0.10,
+            max_concurrent_pos = 3,
         )
-        strategy = TradingStrategy(client, risk, SYMBOLS)
+        strategy = TradingStrategy(client, risk, SYMBOLS, dry_run=dry_run)
         bot_state['started_at'] = datetime.now(TZ).isoformat()
         while bot_state['running']:
             try:
