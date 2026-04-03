@@ -65,9 +65,29 @@ def normalize_candles(raw):
                  'v': c.get('volume', c.get('v', c.get('base_volume', 0)))}
                 for i, c in enumerate(raw)]
     elif isinstance(first, list):
-        # Lijst formaat: [timestamp, open, high, low, close, volume]
-        return [{'t': c[0], 'o': c[1], 'h': c[2], 'l': c[3], 'c': c[4], 'v': c[5] if len(c) > 5 else 0}
-                for c in raw]
+        # Twee mogelijke formaten:
+        # A: [t, open, high, low, close, volume] (standaard/test)
+        # B: [t, volume, close, high, low, open] (Gate.io futures)
+        #
+        # Detectie: in formaat A geldt c[2] (high) >= c[3] (low)
+        #           in formaat B geldt c[3] (high) >= c[4] (low)
+        if len(first) >= 6:
+            try:
+                # Check formaat A: c[2]=high >= c[3]=low
+                a_h = float(first[2]); a_l = float(first[3])
+                # Check formaat B: c[3]=high >= c[4]=low
+                b_h = float(first[3]); b_l = float(first[4])
+                
+                a_valid = a_h >= a_l  # is A logisch? high >= low
+                b_valid = b_h >= b_l  # is B logisch? high >= low
+                
+                if b_valid and not a_valid:
+                    # Formaat B: [t, volume, close, high, low, open]
+                    return [{'t':c[0],'v':c[1],'c':c[2],'h':c[3],'l':c[4],'o':c[5]} for c in raw]
+            except (ValueError, IndexError):
+                pass
+        # Default: formaat A [t, open, high, low, close, volume]
+        return [{'t':c[0],'o':c[1],'h':c[2],'l':c[3],'c':c[4],'v':c[5] if len(c)>5 else 0} for c in raw]
     return raw
 
 
@@ -471,6 +491,191 @@ def run_backtest_real():
         'trades': trades_json,
     })
 
+@app.route('/api/export/backtest', methods=['POST'])
+def export_backtest():
+    """
+    Exporteer backtest resultaten voor alle (of één) coin(s).
+    Haalt echte data op, runt backtests, retourneert downloadbaar JSON.
+    Bevat: candles (compact), trades, equity, statistieken.
+    """
+    import time as _time
+    body = request.json or {}
+    balance = float(body.get('balance', 10))
+    months = int(body.get('months', 6))  # 6 maanden standaard
+    single_coin = body.get('coin', '')   # leeg = alle coins
+
+    # Configuratie per coin: symbol, strategy, interval, max_leverage
+    COIN_CONFIG = [
+        {'symbol': 'BTC_USDT',      'strategy': 'btc_trend',         'interval': '4h', 'leverage': 10},
+        {'symbol': 'ETH_USDT',      'strategy': 'eth_squeeze',       'interval': '1h', 'leverage': 15},
+        {'symbol': 'XRP_USDT',      'strategy': 'xrp_roi',           'interval': '4h', 'leverage': 20},
+        {'symbol': 'FARTCOIN_USDT', 'strategy': 'fartcoin_momentum', 'interval': '5m', 'leverage': 10},
+        {'symbol': 'ADA_USDT',      'strategy': 'ada_supertrend',    'interval': '1h', 'leverage': 15},
+    ]
+
+    # Filter op single coin als opgegeven
+    if single_coin:
+        COIN_CONFIG = [c for c in COIN_CONFIG if single_coin.upper() in c['symbol']]
+        if not COIN_CONFIG:
+            return jsonify({'error': f'Coin {single_coin} niet gevonden'}), 400
+
+    # Bereken periode
+    from datetime import datetime as dt, timedelta
+    to_ts = int(datetime.now(TZ).timestamp())
+    from_ts = int((datetime.now(TZ) - timedelta(days=months * 30)).timestamp())
+    date_from = dt.fromtimestamp(from_ts).strftime('%Y-%m-%d')
+    date_to = dt.fromtimestamp(to_ts).strftime('%Y-%m-%d')
+
+    export = {
+        'export_version': 2,
+        'generated_at': datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
+        'period': {'from': date_from, 'to': date_to, 'months': months},
+        'initial_balance': balance,
+        'coins': {},
+        'summary': {},
+    }
+
+    total_pnl = 0
+    total_trades = 0
+    total_wins = 0
+    total_fees = 0
+    errors = []
+
+    for cfg in COIN_CONFIG:
+        sym = cfg['symbol']
+        strat = cfg['strategy']
+        intv = cfg['interval']
+        lev = cfg['leverage']
+
+        logger.info(f"Export: fetching {sym} {intv} ({months}mo)...")
+
+        try:
+            candles = fetch_historical_candles(sym, intv, from_ts, to_ts)
+            candles = normalize_candles(candles) if candles else []
+        except Exception as e:
+            errors.append(f"{sym}: fetch failed - {e}")
+            continue
+
+        if len(candles) < 100:
+            errors.append(f"{sym}: te weinig data ({len(candles)} candles)")
+            continue
+
+        # Compact candle format: [timestamp, open, high, low, close, volume]
+        compact_candles = []
+        for c in candles:
+            compact_candles.append([
+                c.get('t', 0),
+                round(float(c.get('o', 0)), 8),
+                round(float(c.get('h', 0)), 8),
+                round(float(c.get('l', 0)), 8),
+                round(float(c.get('c', 0)), 8),
+                round(float(c.get('v', 0)), 2),
+            ])
+
+        # Run backtest
+        bt = Backtester(
+            initial_balance=balance, strategy=strat, interval=intv,
+            fee_pct=0.075, slippage_pct=0.05, max_leverage=lev,
+            use_atr_sl=True,
+        )
+        result = bt.run(candles, sym)
+
+        trades_json = [
+            {
+                'dir': t.direction[0],  # 'l' of 's' — compact
+                'entry': round(t.entry_price, 8),
+                'exit': round(t.exit_price, 8),
+                'entry_ts': t.entry_ts,
+                'exit_ts': t.exit_ts,
+                'pnl': round(t.pnl, 6),
+                'pnl_pct': round(t.pnl_pct, 2),
+                'reason': t.exit_reason,
+                'lev': t.leverage,
+                'conf': round(t.confidence, 2),
+            }
+            for t in result.trades
+        ]
+
+        # Equity curve decimeren (max 500 punten)
+        eq = result.equity_curve
+        eq_ts = result.timestamps
+        step = max(1, len(eq) // 500)
+
+        coin_data = {
+            'symbol': sym,
+            'strategy': strat,
+            'interval': intv,
+            'leverage': lev,
+            'candles_count': len(candles),
+            'candle_format': '[timestamp, open, high, low, close, volume]',
+            'candles': compact_candles,
+            'backtest': {
+                'total_trades': result.total_trades,
+                'win_count': result.win_count,
+                'loss_count': result.loss_count,
+                'win_rate': round(result.win_rate, 1),
+                'total_pnl': round(result.total_pnl, 4),
+                'return_pct': round(result.return_pct, 2),
+                'profit_factor': round(result.profit_factor, 2) if result.profit_factor != float('inf') else 999,
+                'max_drawdown': round(result.max_drawdown, 2),
+                'sharpe_ratio': round(result.sharpe_ratio, 2),
+                'initial_balance': result.initial_balance,
+                'final_balance': round(result.final_balance, 4),
+                'total_fees': round(result.total_fees, 4),
+                'avg_trade_pct': round(result.avg_trade_pct, 2),
+                'best_trade': round(result.best_trade, 4),
+                'worst_trade': round(result.worst_trade, 4),
+                'expectancy': round(result.expectancy, 4),
+                'avg_duration': round(result.avg_duration, 1),
+                'max_consec_losses': result.max_consecutive_losses,
+                'long_stats': result.long_stats,
+                'short_stats': result.short_stats,
+            },
+            'trades': trades_json,
+            'equity_curve': eq[::step],
+            'equity_ts': eq_ts[::step] if len(eq_ts) >= len(eq) else [],
+        }
+
+        export['coins'][sym] = coin_data
+        total_pnl += result.total_pnl
+        total_trades += result.total_trades
+        total_wins += result.win_count
+        total_fees += result.total_fees
+
+        logger.info(f"Export: {sym} done — {result.total_trades} trades, PnL={result.total_pnl:+.2f}")
+
+    # Summary
+    export['summary'] = {
+        'coins_exported': len(export['coins']),
+        'total_trades': total_trades,
+        'total_wins': total_wins,
+        'total_win_rate': round(total_wins / total_trades * 100, 1) if total_trades else 0,
+        'total_pnl': round(total_pnl, 4),
+        'total_fees': round(total_fees, 4),
+        'net_pnl': round(total_pnl, 4),
+        'final_balance_all': round(balance * len(export['coins']) + total_pnl, 4),
+        'errors': errors,
+    }
+
+    # Return als downloadbaar JSON bestand
+    from flask import Response
+    import json
+    json_str = json.dumps(export, separators=(',', ':'))
+    filename = f"jefbot_backtest_{date_from}_{date_to}.json"
+
+    return Response(
+        json_str,
+        mimetype='application/json',
+        headers={'Content-Disposition': f'attachment; filename={filename}'}
+    )
+
+
+@app.route('/api/export/backtest/status')
+def export_status():
+    """Check of export bezig is."""
+    return jsonify({'ready': True})
+
+
 @app.route('/api/strategies')
 def get_strategies():
     """Geef lijst van beschikbare strategieën."""
@@ -479,13 +684,13 @@ def get_strategies():
             {'id': 'btc_trend',         'name': 'BTC Trend (EMA ribbon + ADX)',       'coin': 'BTC'},
             {'id': 'eth_squeeze',       'name': 'ETH Squeeze Breakout (BB + OBV)',    'coin': 'ETH'},
             {'id': 'xrp_roi',       'name': 'XRP ROI (4H pullback + BB bounce)',    'coin': 'XRP'},
-            {'id': 'fartcoin_momentum', 'name': 'FARTCOIN Momentum (trend + dip)',     'coin': 'FART'},
+            {'id': 'fartcoin_momentum', 'name': 'FARTCOIN RSI Mean-Reversion',     'coin': 'FART'},
             {'id': 'fartcoin_bb',       'name': 'FARTCOIN Bollinger Bands (4H)',      'coin': 'FART'},
-            {'id': 'ada_supertrend',    'name': 'ADA Supertrend + OBV',               'coin': 'ADA'},
+            {'id': 'ada_supertrend',    'name': 'ADA RSI Mean-Reversion',               'coin': 'ADA'},
             {'id': 'rsi_meanrev',       'name': 'RSI Mean-Reversion (alle coins)',    'coin': 'ALL'},
             {'id': 'ema_crossover',     'name': 'EMA 9/21 Crossover (alle coins)',    'coin': 'ALL'},
             {'id': 'bb_bounce',         'name': 'BB Bounce (alle coins)',             'coin': 'ALL'},
-            {'id': 'general_consensus', 'name': 'Algemeen Consensus (alle coins)',     'coin': 'ALL'},
+            {'id': 'general_consensus', 'name': 'RSI Mean-Reversion (standaard)',     'coin': 'ALL'},
         ]
     })
 
@@ -1610,13 +1815,13 @@ input[type=date]{color-scheme:light}
       </div>
       <div class="field"><label>Strategie</label>
         <select id="bt-strat">
-          <option value="general_consensus">Algemeen Consensus</option>
+          <option value="general_consensus">RSI Mean-Reversion (standaard)</option>
           <option value="btc_trend">BTC Trend (EMA + trendsterkte)</option>
           <option value="eth_squeeze">ETH Squeeze Breakout (BB + OBV)</option>
           <option value="xrp_roi">XRP ROI (4H pullback + BB bounce)</option>
-          <option value="fartcoin_momentum">FARTCOIN Momentum (trend + dip)</option>
+          <option value="fartcoin_momentum">FARTCOIN RSI Mean-Reversion</option>
           <option value="fartcoin_bb">FARTCOIN Bollinger Bands (4H)</option>
-          <option value="ada_supertrend">ADA Supertrend + OBV</option>
+          <option value="ada_supertrend">ADA RSI Mean-Reversion</option>
           <option value="rsi_meanrev">RSI Mean-Reversion (alle coins)</option>
           <option value="ema_crossover">EMA 9/21 Crossover (alle coins)</option>
           <option value="bb_bounce">BB Bounce (alle coins)</option>
@@ -1677,9 +1882,13 @@ input[type=date]{color-scheme:light}
       <button class="btn btn-long" id="btn-bt-real" onclick="runRealBacktest()" style="font-weight:600">
         ⚡ Backtest Echte Data (Gate.io)
       </button>
+      <button class="btn btn-short" id="btn-export" onclick="exportBacktest()" style="font-weight:600;background:var(--purple,#8b5cf6);border-color:var(--purple,#8b5cf6)">
+        📦 Export Alle Coins (6 mnd)
+      </button>
     </div>
     <div style="margin-top:8px;font-size:11px;color:var(--text3)">
       "Recent" gebruikt de laatste N candles. "Echte Data" haalt de volledige periode op van Gate.io (geen API key nodig).
+      "Export" haalt 6 maanden data op voor alle 5 coins, runt backtests, en download een JSON die je aan Claude kunt geven.
     </div>
   </div>
 
@@ -2513,6 +2722,45 @@ async function runRealBacktest() {
     btn.disabled=false;
     btn.textContent='⚡ Backtest Echte Data (Gate.io)';
     document.getElementById('bt-loading').style.display='none';
+  }
+}
+
+async function exportBacktest() {
+  const btn = document.getElementById('btn-export');
+  const bal = parseFloat(document.getElementById('bt-bal').value) || 10;
+  btn.disabled = true;
+  btn.textContent = '⏳ Alle coins ophalen... (dit duurt 1-2 min)';
+
+  try {
+    const r = await fetch('/api/export/backtest', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ balance: bal, months: 6 })
+    });
+
+    if (!r.ok) {
+      const err = await r.json();
+      toast(err.error || 'Export mislukt', 'err');
+      return;
+    }
+
+    // Download als bestand
+    const blob = await r.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const cd = r.headers.get('Content-Disposition') || '';
+    const fn = cd.includes('filename=') ? cd.split('filename=')[1] : 'jefbot_backtest.json';
+    a.href = url; a.download = fn;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+
+    toast('✓ Export gedownload! Upload dit bestand naar Claude voor analyse.', 'ok');
+  } catch(e) {
+    toast('Export fout: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📦 Export Alle Coins (6 mnd)';
   }
 }
 

@@ -440,10 +440,10 @@ STRATEGIES = {
     'btc_trend':         _sig_btc,
     'eth_squeeze':       _sig_eth,
     'xrp_roi':           _sig_xrp,
-    'fartcoin_momentum': _sig_fartcoin,
+    'fartcoin_momentum': _sig_rsi_meanrev,    # RSI meanrev = beste op echte data
     'fartcoin_bb':       _sig_fartcoin_bb,
-    'ada_supertrend':    _sig_ada,
-    'general_consensus': _sig_btc,  # consensus verwijderd, BTC als default
+    'ada_supertrend':    _sig_rsi_meanrev,    # RSI meanrev = beste op echte data
+    'general_consensus': _sig_rsi_meanrev,    # RSI meanrev als default
     'rsi_meanrev':       _sig_rsi_meanrev,
     'ema_crossover':     _sig_ema_cross,
     'bb_bounce':         _sig_bb_bounce,
@@ -570,9 +570,25 @@ class Backtester:
         return notional * (self.fee_pct + self.slippage_pct)
 
     def run(self, candles, symbol, date_from=None, date_to=None):
+        # Normaliseer candles naar dict formaat als het lijsten zijn
+        if candles and isinstance(candles[0], list):
+            first = candles[0]
+            is_format_b = False
+            if len(first) >= 6:
+                try:
+                    a_h=float(first[2]); a_l=float(first[3])
+                    b_h=float(first[3]); b_l=float(first[4])
+                    if b_h >= b_l and a_h < a_l:
+                        is_format_b = True  # Gate.io [t, v, c, h, l, o]
+                except (ValueError, IndexError):
+                    pass
+            if is_format_b:
+                candles = [{'t':c[0],'v':c[1],'c':c[2],'h':c[3],'l':c[4],'o':c[5]} for c in candles]
+            else:
+                candles = [{'t':c[0],'o':c[1],'h':c[2],'l':c[3],'c':c[4],'v':c[5] if len(c)>5 else 0} for c in candles]
+
         def _f(c,k,d=0.0):
-            if isinstance(c,list): return float(c[{'o':1,'h':2,'l':3,'c':4,'v':5}.get(k,0)]) if len(c)>5 else d
-            return float(c.get(k,d))
+            return float(c.get(k,d)) if isinstance(c,dict) else d
         def _ts(c):
             if isinstance(c,list): return int(c[0]) if c else 0
             return int(c.get('t',c.get('time',0)))
@@ -805,6 +821,7 @@ class Backtester:
             # Entry fee
             entry_fee = self._calc_fee(contracts, price)
             result.total_fees += entry_fee
+            balance -= entry_fee  # FIX: entry fee direct van balance aftrekken
 
             open_trade=Trade(symbol=symbol,strategy=self.strategy,
                 direction=sig,entry_price=price,entry_index=i,entry_ts=ts,

@@ -635,6 +635,27 @@ class TradingStrategy:
 
         return 'none', 0.0
 
+    # ==========================================================================
+    # RSI MEAN-REVERSION — bewezen beste strategie op echte data
+    # Simpel: koop RSI oversold bounce, verkoop RSI overbought drop
+    # ==========================================================================
+    def _signal_rsi_meanrev(self, o: dict) -> Tuple[str, float]:
+        c = o['closes']
+        rv = rsi(c, 14)
+        e50 = ema(c, 50)
+        if not rv or not e50 or len(rv) < 2:
+            return 'none', 0.0
+
+        cr = rv[-1]; pcr = rv[-2]
+
+        # Long: RSI < 30 en keert om (stijgt) = bounce bevestigd
+        if cr < 30 and cr > pcr:
+            return 'long', 0.80
+        # Short: RSI > 70 en keert om (daalt) = top bevestigd
+        if cr > 70 and cr < pcr:
+            return 'short', 0.80
+        return 'none', 0.0
+
     # -- Router ----------------------------------------------------------------
 
     def generate_signal(self, ohlcv: dict, symbol: str = '',
@@ -643,9 +664,9 @@ class TradingStrategy:
             if   'BTC'      in symbol: sig, conf = self._signal_btc(ohlcv, trend_data)
             elif 'ETH'      in symbol: sig, conf = self._signal_eth(ohlcv)
             elif 'XRP'      in symbol: sig, conf = self._signal_xrp(ohlcv)
-            elif 'FARTCOIN' in symbol: sig, conf = self._signal_fartcoin(ohlcv)
-            elif 'ADA'      in symbol: sig, conf = self._signal_ada(ohlcv)
-            else:                      sig, conf = self._signal_btc(ohlcv, trend_data)
+            elif 'FARTCOIN' in symbol: sig, conf = self._signal_rsi_meanrev(ohlcv)
+            elif 'ADA'      in symbol: sig, conf = self._signal_rsi_meanrev(ohlcv)
+            else:                      sig, conf = self._signal_rsi_meanrev(ohlcv)
 
             # Adaptieve drempel: als recente winrate laag is, is de drempel verhoogd
             # Safety cap: drempel kan nooit boven 0.60 (anders blokkeert alles)
